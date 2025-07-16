@@ -64,6 +64,7 @@ parsedatetime==2.6
 pathmagic==0.3.14
 pillow==11.3.0
 prettierfier==1.0.3
+PyMuPDF==1.23.9
 proglog==0.1.12
 prov==2.1.1
 psycopg2==2.9.10
