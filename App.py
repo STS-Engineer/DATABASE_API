@@ -9,7 +9,7 @@ import fitz  # PyMuPDF
 import psycopg2
 import logging
 import base64
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
 from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Database Connection String from .env file
 # Example: "postgresql://user:password@host:port/database"
 DATABASE_URL = os.getenv("DATABASE_URL")
-API_KEY = os.getenv("API_KEY")  
+
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
 
@@ -32,7 +32,6 @@ def init_db():
     Initializes the database and creates the EDIGlobal table if it doesn't exist.
     This function is safe to run even if the table already exists.
     """
-    # This check is added to ensure the script doesn't fail if DATABASE_URL is not set
     if not DATABASE_URL:
         logging.warning("DATABASE_URL not set. Skipping database initialization.")
         return
@@ -67,7 +66,6 @@ def init_db():
         logging.error(f"Error connecting to the database: {e}")
     except Exception as e:
         logging.error(f"An unexpected error occurred during DB initialization: {e}")
-
 
 # --- CORE LOGIC FUNCTIONS ---
 
@@ -190,7 +188,6 @@ def save_to_postgres(records: list):
             conn.rollback()
         return False
 
-
 # --- API ENDPOINT ---
 @app.route("/process-valeo-pdf", methods=['POST'])
 def process_pdf_endpoint():
@@ -199,10 +196,6 @@ def process_pdf_endpoint():
     Extracts customer_code from the filename (e.g., CXXXXX_...).
     Expects JSON: {"file_name": "...", "file_content_base64": "..."}
     """
-    # --- API KEY CHECK (ADD THIS BLOCK) ---
-    client_key = request.headers.get('x-api-key')
-    if not client_key or client_key != API_KEY:
-        abort(401, description="Invalid or missing API key.")
     # 1. Get data from the request
     data = request.get_json()
     required_keys = ['file_name', 'file_content_base64']
@@ -250,7 +243,6 @@ def process_pdf_endpoint():
         "customer_code_found": customer_code,
         "records_processed": len(extracted_records)
     }), 201
-
 
 # --- MAIN EXECUTION ---
 if __name__ == '__main__':
