@@ -70,43 +70,73 @@ def init_db():
 # --- CORE LOGIC FUNCTIONS ---
 
 def process_valeo_pdf(pdf_bytes: io.BytesIO, customer_code: str, customer_name: str, site="Germany"):
-    """
-    Processes VALEO PDF format from a byte stream for EDIGlobal insertion.
-    (This function contains your custom processing logic and remains unchanged).
-    """
-    full_text = ""
+    """Process VALEO PDF format for EDIGlobal insertion (latest logic)"""
+    # 1. Extract text from PDF
     try:
-        # 1. Extract all text from the PDF
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            for page in doc:
-                full_text += page.get_text()
+            text = "".join(page.get_text() for page in doc)
     except Exception as e:
         logging.error(f"Failed to parse PDF file with PyMuPDF: {e}")
         raise ValueError(f"Failed to parse PDF file: {e}")
 
-    # 2. Extract data based on VALEO format
-    forecast_match = re.search(r"Druckdatum:(?:\s|\n|\r)*.*?(\d{2}\.\d{2}\.\d{4})", full_text)
-    forecast_date = forecast_match.group(1) if forecast_match else None
+    # 2. ForecastDate extraction (from Druckdatum)
+    forecast_match = re.search(
+    r"Druckdatum:(?:\s|\n|\r)+(?:Seite:.*\n)?(\d{2}\.\d{2}\.\d{4})", text
+)
+    if not forecast_match:
+        # Try a looser fallback: look for first date after "Druckdatum"
+        lines = text.splitlines()
+        idx = next((i for i, l in enumerate(lines) if "Druckdatum" in l), None)
+        forecast_date = None
+        if idx is not None:
+            for lookahead in range(1, 4):
+                if idx+lookahead < len(lines):
+                    m = re.search(r"(\d{2}\.\d{2}\.\d{4})", lines[idx+lookahead])
+                    if m:
+                        forecast_date = m.group(1)
+                        break
+    else:
+        forecast_date = forecast_match.group(1)
     if not forecast_date:
-        raise ValueError("ForecastDate (Druckdatum) could not be extracted.")
+        raise ValueError("ForecastDate (Druckdatum) could not be extracted. Please check the PDF content.")
 
+    # 3. Material mappings
     material_map = {
-        "1023093": "190313", "1023645": "191663", "1026188": "187144",
-        "1026258": "194470", "1026540": "202066", "1026629": "214188"
+        "1023093": "190313",
+        "1023645": "191663",
+        "1026188": "187144",
+        "1026258": "194470",
+        "1026540": "202066",
+        "1026629": "214188"
     }
     reverse_map = {v: k for k, v in material_map.items()}
 
-    sections = re.split(r"Sachnummer:\s+", full_text)[1:]
+    sections = re.split(r"Sachnummer:\s+", text)[1:]
     results = []
 
     for section in sections:
+        # Extract delivery info from current section only
         last_deliv_match = re.search(r"Lieferscheinnr.*?Datum:\s*(\d{2}\.\d{2}\.\d{4}).*?Menge:\s*(\d+)", section, re.DOTALL)
         last_delivery_date = last_deliv_match.group(1) if last_deliv_match else None
         last_delivered_qty = int(last_deliv_match.group(2)) if last_deliv_match else None
 
+        section = re.sub(r"Druckdatum:\s*\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}", "", section)
+        section = re.sub(r"Seite:\s*\d+\s+von\s+\d+", "", section)
+
+        # article (optional, for trace/debug/future use)
+        article_match = re.search(r"Bezeichnung:\s*(.*?)\s+Ersetzt", section)
+        article = article_match.group(1).strip() if article_match else "UNKNOWN"
+
+        mat_desc_match = re.search(
+            r"Materialbeschreibung\s+\(Kunde\):\s*(.*?)\s+(?:Ersetzt|Sachnr\.|Liefer|\d{2}\.\d{2}\.\d{4})",
+            section, re.DOTALL
+        )
+        material_description = mat_desc_match.group(1).strip() if mat_desc_match else article
+
+        # Valeo logic
         material_match = re.match(r"0*(\d+)", section)
         raw_client_code = material_match.group(1) if material_match else None
-        
+
         customer_code_val = "100442"
         avo_code = raw_client_code or "UNKNOWN"
 
@@ -118,32 +148,42 @@ def process_valeo_pdf(pdf_bytes: io.BytesIO, customer_code: str, customer_name: 
                 customer_code_val = raw_client_code
                 avo_code = reverse_map[raw_client_code]
 
+        # Daily and week-based deliveries
         delivery_lines = re.findall(
             r"((?:\d{2}\.\d{2}\.\d{4})|(?:20\d{2}\s*w\d{2}\s*-\s*20\d{2}\s*w\d{2}))\s+(\d+)\s+(\d+)",
             section
         )
-
         for date_or_range, qty_str, cum_qty_str in delivery_lines:
             if "w" in date_or_range:
                 from_to_match = re.match(r"(20\d{2}\s*w\d{2})\s*-\s*(20\d{2}\s*w\d{2})", date_or_range)
-                date_from = from_to_match.group(1) if from_to_match else date_or_range
-                date_until = from_to_match.group(2) if from_to_match else date_or_range
+                if from_to_match:
+                    date_from = from_to_match.group(1)
+                    date_until = from_to_match.group(2)
+                else:
+                    date_from = date_until = date_or_range
             else:
                 date_from = date_until = date_or_range
 
             results.append({
-                "Site": site, "ClientCode": "100442", "ClientMaterialNo": customer_code_val,
-                "AVOMaterialNo": avo_code, "DateFrom": date_from, "DateUntil": date_until,
-                "Quantity": int(qty_str), "ForecastDate": forecast_date,
-                "LastDeliveryDate": last_delivery_date, "LastDeliveredQuantity": last_delivered_qty,
-                "CumulatedQuantity": int(cum_qty_str), "EDIStatus": "Forecast"
+                "Site": site,
+                "ClientCode": "100442",
+                "ClientMaterialNo": customer_code_val,
+                "AVOMaterialNo": avo_code,
+                "DateFrom": date_from,
+                "DateUntil": date_until,
+                "Quantity": int(qty_str),
+                "ForecastDate": forecast_date,
+                "LastDeliveryDate": last_delivery_date,
+                "LastDeliveredQuantity": last_delivered_qty,
+                "CumulatedQuantity": int(cum_qty_str),
+                "EDIStatus": "Forecast"
             })
 
     if not results:
         raise ValueError("No valid delivery data found in the VALEO PDF.")
-    
     logging.info(f"Successfully extracted {len(results)} records from the PDF.")
     return results
+
 
 def save_to_postgres(records: list):
     """Saves a list of extracted data records to the PostgreSQL database."""
