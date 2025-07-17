@@ -282,7 +282,7 @@ def process_pdf_endpoint():
         "file_processed": file_name,
         "customer_code_found": customer_code,
         "records_processed": len(extracted_records)
-    }), 201
+    }), 200
 
 # --- MAIN EXECUTION ---
 if __name__ == '__main__':
