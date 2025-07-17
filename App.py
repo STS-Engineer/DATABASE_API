@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Database Connection String from .env file
 # Example: "postgresql://user:password@host:port/database"
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = "postgresql://adminavo:%24%23fKcdXPg4%40ue8AW@avo-adb-001.postgres.database.azure.com:5432/EDI%20IA"
 
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
