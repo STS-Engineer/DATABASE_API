@@ -8,7 +8,7 @@ import psycopg2
 import pdfplumber
 import PyPDF2
 from psycopg2 import errors
-from datetime import datetime
+from datetime import datetime ,date
 import re
 from collections import defaultdict
 import os
@@ -48,6 +48,44 @@ def detect_company_and_prepare(rows):
             return 'Nidec', header
     return None, header
 
+
+
+
+def to_a_week(date_str):
+    """Convertit une date en chaîne 'YYYY-WXX' (semaine ISO), sans ajustement."""
+    dt = parse_date_flexible(date_str)
+    if not dt:
+        return ""
+    week = dt.isocalendar()[1]
+    year = dt.isocalendar()[0]
+    return f"{year}-W{week:02d}"
+
+
+
+
+def to_forecast_week(raw):
+    """Convertit une date (format libre) ou CW en semaine ISO 'YYYY-WXX'"""
+    raw = raw.strip()
+    if not raw or raw.upper() == "BACKORDER":
+        return raw  # conserve BACKORDER tel quel
+    # Cas CW 37/2025
+    m = re.match(r"CW\s*(\d{1,2})/(\d{4})", raw, re.IGNORECASE)
+    if m:
+        week = int(m.group(1))
+        year = int(m.group(2))
+        return f"{year}-W{week:02d}"
+
+    # Sinon, essaye de parser une vraie date
+    dt = parse_date_flexible(raw)
+    if dt:
+        week = dt.isocalendar()[1]
+        year = dt.isocalendar()[0]
+        return f"{year}-W{week:02d}"
+    
+    logging.warning(f"[Valeo] Format de date inconnu: '{raw}'")
+    return ""
+
+
 def process_valeo_rows(rows, header):
     plant_to_client = {
         "SK01": "C00250",
@@ -78,22 +116,34 @@ def process_valeo_rows(rows, header):
             material_code = row[idx['Material_No_Customer']].strip()
             if not material_code.startswith("V"):
                 AVOmaterial_code = "V" + material_code
+            if client_code == "C00250":
+                AVOmaterial_code = AVOmaterial_code + "POL"
+            elif client_code == "C00303":
+                AVOmaterial_code = AVOmaterial_code + "SLP"
+            else : 
+                AVOmaterial_code = AVOmaterial_code
             processed.append({
                 "Site": "Tunisia",
                 "ClientCode": client_code,
                 "ClientMaterialNo": material_code,
                 "AVOMaterialNo": AVOmaterial_code,
-                "DateFrom": delivery_date,
-                "DateUntil": delivery_date,
+                "DateFrom": to_forecast_week(delivery_date),
+                "DateUntil": to_forecast_week(delivery_date),
                 "Quantity": int(row[idx['Despatch_Qty']].strip() or 0),
-                "ForecastDate": forecast_date,
-                "LastDeliveryDate": row[idx['Last_Delivery_Note_Date']].strip(),
+                "ForecastDate": to_forecast_week(date_str),
+                "LastDeliveryDate": to_forecast_week(row[idx['Last_Delivery_Note_Date']].strip()),
                 "LastDeliveredQuantity": int(row[idx['Last_Delivery_Quantity']].strip() or 0),
                 "CumulatedQuantity": int(row[idx['Cum_Quantity']].strip() or 0),
-                "EDIStatus": row[idx['Commitment_Level']].strip(),
+                "EDIStatus": {
+                    "p": "Forecast",
+                    "P": "Forecast",
+                    "f": "Firm",
+                    "F": "Firm"
+                }.get(row[idx['Commitment_Level']].strip(), row[idx['Commitment_Level']].strip()),
                 "ProductName": row[idx['Description']].strip(),
                 "LastDeliveryNo": row[idx['Last_Delivery_Note']].strip()
             })
+
         except Exception as e:
             logging.error(f"Valeo row processing error: {e}")
     logging.warning(f"DEBUG: Valeo processed {len(processed)} records from {len(rows)-1} data rows")
@@ -105,14 +155,28 @@ def extract_material_code(val):
         return f"{match.group(1)}"
     return ""
 
+
 def parse_date_flexible(date_str):
     """Try multiple date formats and return a datetime object or None."""
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%m/%d/%Y"):
+    formats = [
+        "%Y-%m-%d",   # e.g. 2025-07-03
+        "%d.%m.%Y",   # e.g. 03.07.2025
+        "%d/%m/%Y",   # e.g. 03/07/2025
+        "%d/%m/%y",   # e.g. 03/07/25 ← important!
+        "%Y/%m/%d",   # e.g. 2025/07/03
+        "%d-%m-%Y",   # e.g. 03-07-2025
+        "%d-%m-%y",   # e.g. 03-07-25
+        "%m/%d/%Y",   # e.g. 07/03/2025 (US-style)
+    ]
+    
+    for fmt in formats:
         try:
             return datetime.strptime(date_str.strip(), fmt)
         except (ValueError, TypeError):
             continue
     return None
+
+
 
 def process_inteva_rows(rows, header):
     site_to_client = {
@@ -179,20 +243,29 @@ def process_inteva_rows(rows, header):
             last_receipt_date_dt = parse_date_flexible(last_receipt_date_raw)
             last_receipt_date = last_receipt_date_dt.strftime("%Y-%m-%d") if last_receipt_date_dt else ""
             AVOmaterial_code = "V" + material_code
+            if client_code == "C00241" :
+                AVOmaterial_code =  AVOmaterial_code + "GAD"
+            else : 
+                AVOmaterial_code =  AVOmaterial_code
         
             processed.append({
                 "Site": "Tunisia",
                 "ClientCode": client_code,
                 "ClientMaterialNo": material_code,
                 "AVOMaterialNo": AVOmaterial_code,
-                "DateFrom": row[idx['Due Date']].strip(),
+                "DateFrom": to_a_week(row[idx['Due Date']].strip()),
                 "DateUntil": row[idx['Due Date']].strip(),
                 "Quantity": qty,
                 "ForecastDate": forecast_date,
-                "LastDeliveryDate": last_receipt_date,
+                "LastDeliveryDate": to_a_week(last_receipt_date),
                 "LastDeliveredQuantity": parse_euro_number(row[idx['Last Receipt Quantity']].strip()),
                 "CumulatedQuantity": cumulated,
-                "EDIStatus": row[idx['Release Status']].strip(),
+                "EDIStatus": {
+                    "On Order": "Firm",
+                    "Forecast": "Forecast",
+                    "ON ORDER": "Firm",
+                    "FORECAST": "Forecast"
+                }.get(row[idx['Release Status']].strip(), row[idx['Release Status']].strip()),
                 "ProductName": row[idx['Description']].strip(),
                 "LastDeliveryNo": None
 
@@ -274,11 +347,11 @@ def process_nidec_rows(rows, header):
                 "ClientCode": client_code,
                 "ClientMaterialNo": material_code,      # as is from the file
                 "AVOMaterialNo": avo_material_code,     # transformed as per rule
-                "DateFrom": row[idx['DateFrom']].strip(),
+                "DateFrom": to_forecast_week(row[idx['DateFrom']].strip()),
                 "DateUntil": row[idx['DateUntil']].strip(),
                 "Quantity": parse_euro_number(row[idx['DespatchQty']].strip()),
                 "ForecastDate": forecast_date,
-                "LastDeliveryDate": row[idx['LastDeliveryDate']].strip(),
+                "LastDeliveryDate": to_forecast_week(row[idx['LastDeliveryDate']].strip()),
                 "LastDeliveredQuantity": parse_euro_number(row[idx['LastDeliveryQuantity']].strip()),
                 "CumulatedQuantity": parse_euro_number(row[idx['CumQuantity']].strip()),
                 "EDIStatus": row[idx['Status']].strip(),
@@ -478,6 +551,8 @@ def extract_value_after_label(lines, label, default=None):
                 return lines[i+1].strip()
     return default
 
+
+
 def process_pierburg_pdf(file_bytes, file_name):
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         all_text = "\n".join(page.extract_text() or '' for page in pdf.pages)
@@ -543,17 +618,19 @@ def process_pierburg_pdf(file_bytes, file_name):
             if not m:
                 continue
             delivery_date, dispatch_qty, cum_quantity, diff_commit = m.groups()
+            if diff_commit == "Fix":
+                diff_commit="Firm"
             results.append({
                 "Site": "Tunisia",
                 "ClientCode": "C00285",
                 "ClientMaterialNo": material_customer,
                 "AVOMaterialNo": f"V{material_customer}",
-                "DateFrom": delivery_date,
+                "DateFrom": to_a_week(delivery_date),
                 "DateUntil": delivery_date,
                 "Quantity": parse_euro_number(dispatch_qty),
                 "ForecastDate": forecast_date,
                 "LastDeliveryNo": last_delivery_no,
-                "LastDeliveryDate": last_delivery_date,
+                "LastDeliveryDate": to_a_week(last_delivery_date),
                 "LastDeliveredQuantity": last_delivered_qty,
                 "CumulatedQuantity": parse_euro_number(cum_quantity),
                 "EDIStatus": diff_commit,
@@ -648,7 +725,7 @@ def process_nidec_pdf(file_bytes, file_name):
                 "ClientCode": "C00260",
                 "ClientMaterialNo": item_code,
                 "AVOMaterialNo": avo_material_no,
-                "DateFrom": req_date,
+                "DateFrom": to_a_week(req_date),
                 "DateUntil": req_date,
                 "Quantity": quantity,
                 "ForecastDate": forecast_date,
@@ -668,11 +745,48 @@ def process_nidec_pdf(file_bytes, file_name):
     return results
 
 
+
+
 def parse_week_number(date_str):
-    dt = datetime.strptime(date_str, "%m/%d/%Y")
-    week_num = dt.isocalendar()[1] + 1
-    year = dt.isocalendar()[0]
-    return f"{year}-W{week_num:02d}"
+    if not date_str:
+        return ""
+    
+    formats = ["%m/%d/%Y", "%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            week_num = dt.isocalendar()[1]
+            year = dt.isocalendar()[0]
+            return f"{year}-W{week_num:02d}"
+        except ValueError:
+            continue
+
+    logging.warning(f"[parse_week_number] Invalid date: {date_str}")
+    return ""
+
+
+
+
+def convert_mmddyyyy_to_week(date_str):
+    """
+    Convert a MM/DD/YYYY date string to ISO week format YYYY-WXX.
+    Returns empty string on failure.
+    """
+    try:
+        logging.warning(f"[convert_mmddyyyy_to_week] Raw input: {date_str}")
+        month, day, year = map(int, date_str.strip().split("/"))
+        dt = date(year, month, day)
+        iso_year, iso_week, _ = dt.isocalendar()
+        week_str = f"{iso_year}-W{iso_week:02d}"
+        logging.warning(f"[convert_mmddyyyy_to_week] Parsed: {dt} → Week: {week_str}")
+        return week_str
+    except Exception as e:
+        logging.error(f"[convert_mmddyyyy_to_week] Error: {e}")
+        return ""
+
+
+
 
 def parse_any_date(raw_date):
     """Force le format MM/DD/YYYY uniquement"""
@@ -695,15 +809,16 @@ def process_valeo_campinas_pdf(pdf_bytes, file_name):
     m_date = re.search(r"DATE[: ]+(\d{2}/\d{2}/\d{4})", full_text)
     forecast_week = ""
     if m_date:
-        forecast_week = parse_week_number(m_date.group(1))
-        logging.info(f"[VALEO] Global Forecast week: {forecast_week}")
+        raw_forecast_date = m_date.group(1)
+        logging.warning(f"[VALEO] Raw Forecast Date from document: {raw_forecast_date}")
+        forecast_week = convert_mmddyyyy_to_week(raw_forecast_date)
+        logging.warning(f"[VALEO] Converted Forecast week: {forecast_week}")
     else:
         logging.warning(f"[VALEO] No forecast date found in the entire document.")
 
     # Split into sections by SCHEDULING AGREEMENT
     sched_split = list(re.finditer(r"SCHEDULING AGREEMENT \d+", full_text))
     agreement_numbers = [re.search(r"(\d+)", m.group()).group(1) for m in sched_split]
-    logging.info(f"[VALEO] Found {len(agreement_numbers)} scheduling agreement sections.")
 
     # Find the start page for each agreement
     agreement_start_pages = []
@@ -718,12 +833,11 @@ def process_valeo_campinas_pdf(pdf_bytes, file_name):
         section_start_page = agreement_start_pages[idx]
         section_end_page = agreement_start_pages[idx + 1]
         section_pages = all_pages_text[section_start_page:section_end_page]
-        logging.info(f"[VALEO][AGREEMENT {agreement_no}] Processing section...")
 
         current_material = None
         current_product = None
         avo_material = None
-        last_delivery_date = None
+        raw_last_date = ""
         last_delivery_no = None
         last_delivered_qty = None
 
@@ -735,57 +849,48 @@ def process_valeo_campinas_pdf(pdf_bytes, file_name):
                 current_material = m_prod.group(1)
                 current_product = m_prod.group(2).strip()
                 avo_material = "V" + current_material
-                logging.info(f"[VALEO][{agreement_no}][PAGE {page_no+1}] Material: {current_material}, Product: {current_product}")
 
-            # Last Delivery block (from this page only, if present)
+            # Last Delivery block
             m_last = re.search(
                 r"LAST DELIVERY.*?DEL DATE\s+DOCUMENT\s+QUANTITY\s*\n?(\d{2}/\d{2}/\d{4})\s+(\S+)\s+([\d,\.]+)",
                 page_text, re.DOTALL)
             if m_last:
-                last_delivery_date = parse_date_flexible(m_last.group(1))
-                if last_delivery_date:
-                    last_delivery_date = last_delivery_date.strftime("%Y-%m-%d")  # Ensures string only, no time
+                raw_last_date = m_last.group(1)
+                logging.warning(f"[VALEO][{agreement_no}][PAGE {page_no+1}] Raw LastDeliveryDate: {raw_last_date}")
                 last_delivery_no = m_last.group(2)
                 last_delivered_qty = pars_euro_number(m_last.group(3))
-                logging.info(f"[VALEO][{agreement_no}][PAGE {page_no+1}] LastDeliveryDate: {last_delivery_date}, LastDeliveryNo: {last_delivery_no}, LastDeliveredQty: {last_delivered_qty}")
 
-            # Allow date_str to be missing (optional group!)
+            # Forecast rows
             forecast_rows = re.findall(
                 r"(FORECAST|PAST DUE)\s+(\d{2}/\d{2}/\d{4})?\s+([\d,.]+)\s+([\d,.]+)", page_text)
-            logging.info(f"[VALEO][{agreement_no}][PAGE {page_no+1}] Found {len(forecast_rows)} forecast rows.")
 
             for idx_row, (status, date_str, qty, cumm) in enumerate(forecast_rows):
-                # If date_str is None, fill with empty string
-                if date_str is None:
-                    date_str = ""
-                elif not date_str:
-                    date_str = ""
-
-                # Log the insertion of rows even with missing dates
                 if not date_str:
+                    date_str = ""
                     logging.warning(f"[VALEO][{agreement_no}][PAGE {page_no+1}][ROW {idx_row}] Inserting row with missing date: {status}, {qty}, {cumm}")
+                if avo_material not in ("V1001MR035","VW000056480","VW000024158") and not avo_material.endswith("BRA"):
+                    avo_material += "BRA"
 
                 row = {
                     "ClientCode": "C00072",
                     "SchedulingAgreement": agreement_no,
-                    "ForecastDate": forecast_week,  # <-- GLOBAL FOR ALL ROWS
+                    "ForecastDate": forecast_week,
                     "ClientMaterialNo": current_material,
                     "AVOMaterialNo": avo_material,
                     "ProductName": current_product,
                     "EDIStatus": status,
-                    "DateFrom": date_str,
+                    "DateFrom": convert_mmddyyyy_to_week(date_str),
                     "DateUntil": date_str,
                     "Quantity": float(qty.replace(',', '').replace('.', '')),
                     "CumulatedQuantity": float(cumm.replace(',', '').replace('.', '')),
-                    "LastDeliveryDate": last_delivery_date,
+                    "LastDeliveryDate": convert_mmddyyyy_to_week(raw_last_date),
                     "LastDeliveryNo": last_delivery_no,
                     "LastDeliveredQuantity": last_delivered_qty,
                     "Site": "Tunisia"
                 }
                 data.append(row)
-                logging.warning(f"[VALEO][{agreement_no}][PAGE {page_no+1}][ROW {idx_row}] Row: {row}")
 
-    # Deduplicate rows by primary key before return (extra safety)
+    # Deduplicate rows
     unique_rows = {}
     for row in data:
         pk = (
@@ -798,7 +903,6 @@ def process_valeo_campinas_pdf(pdf_bytes, file_name):
 
     logging.info(f"[VALEO] Extraction complete. Total records: {len(data)}")
     return data
-
 
 
 def to_adjusted_iso_week(date_str):
@@ -815,6 +919,38 @@ def to_adjusted_iso_week(date_str):
         logging.warning(f"Couldn't convert ForecastDate '{date_str}' to week: {e}")
         return ""
 
+
+def to_week(date_str: str) -> str:
+    date_str = date_str.strip()
+
+    # Case 1: Format is WW.YYYY → like 38.2025
+    if re.match(r"^\d{2}\.\d{4}$", date_str):
+        week, year = date_str.split(".")
+        try:
+            week = int(week)
+            year = int(year)
+            # Get Monday of that ISO week
+            date_obj = datetime.strptime(f"{year}-W{week}-1", "%Y-W%W-%w")
+            return f"{year}-W{week:02d}"
+        except Exception as e:
+            logging.warning(f"[to_a_week] Failed to parse WW.YYYY: {date_str} – {e}")
+            return date_str
+
+    # Case 2: Format is DD.MM.YYYY
+    if re.match(r"^\d{2}\.\d{2}\.\d{4}$", date_str):
+        try:
+            date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+            week = date_obj.isocalendar()[1]
+            if date_obj.weekday() > 1:  # Add +1 to match your logic
+                week += 1
+            return f"{date_obj.year}-W{week:02d}"
+        except Exception as e:
+            logging.warning(f"[to_a_week] Failed to parse DD.MM.YYYY: {date_str} – {e}")
+            return date_str
+
+    # Unknown format, return as-is
+    logging.warning(f"[to_a_week] Unknown format: {date_str}")
+    return date_str
 
 
 def process_valeo_nevers_pdf(pdf_bytes, file_name):
@@ -912,10 +1048,10 @@ def process_valeo_nevers_pdf(pdf_bytes, file_name):
         logging.info(f"[VALEO NEVERS][AGREEMENT {agreement_no}] Found {len(planning_lines)} planning lines.")
 
         edi_map = {
-            "PAST DUE": "PAST DUE",
-            "FIRM AUTHORIZED SHIPPMENTS": "FIRM AUTHORIZED",
-            "PLANNED SHIPPMENTS": "PLANNED SHIPPMENTS",
-            "FORECAST": "FORECAST",
+            "PAST DUE": "Past Due",
+            "FIRM AUTHORIZED SHIPPMENTS": "Firm",
+            "PLANNED SHIPPMENTS": "Firm",
+            "FORECAST": "Forecast",
         }
 
         last_status = None
@@ -943,10 +1079,10 @@ def process_valeo_nevers_pdf(pdf_bytes, file_name):
                 last_status = None  # Reset until next status line
 
                 edi_map = {
-                    "PAST DUE": "PAST DUE",
-                    "FIRM AUTHORIZED SHIPPMENTS": "FIRM AUTHORIZED",
-                    "PLANNED SHIPPMENTS": "PLANNED SHIPPMENTS",
-                    "FORECAST": "FORECAST",
+                    "PAST DUE": "Past Due",
+                    "FIRM AUTHORIZED SHIPPMENTS": "Firm",
+                    "PLANNED SHIPPMENTS": "Firm",
+                    "FORECAST": "Forecast",
                 }
                 edi_status = edi_map.get(edi_status, edi_status)
                 date_from = date_from.replace("D", "").replace("W", "") if date_from else ""
@@ -971,11 +1107,11 @@ def process_valeo_nevers_pdf(pdf_bytes, file_name):
                     "AVOMaterialNo": avo_material,
                     "ProductName": current_product,
                     "EDIStatus": edi_status,
-                    "DateFrom": date_from,
+                    "DateFrom": to_week(date_from),
                     "DateUntil": date_from,
                     "Quantity": quantity,
                     "CumulatedQuantity": cumulated,
-                    "LastDeliveryDate": last_delivery_date,
+                    "LastDeliveryDate": to_week(last_delivery_date),
                     "LastDeliveredQuantity": last_delivery_qty,
                     "LastDeliveryNo": last_delivery_doc,
                 }
