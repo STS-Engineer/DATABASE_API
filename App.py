@@ -1231,5 +1231,119 @@ def process_file_endpoint():
 
 
 
+
+
+
+@app.route("/detect-client-info", methods=["POST"])
+def detect_client_info():
+    data = request.get_json()
+    required_keys = ['file_name', 'file_content_base64']
+    if not data or not all(k in data for k in required_keys):
+        missing_keys = [k for k in required_keys if k not in data]
+        return jsonify({"error": f"Missing keys in request body: {', '.join(missing_keys)}"}), 400
+
+    file_name = data['file_name']
+    file_content_base64 = data['file_content_base64']
+    file_type = data.get('file_type', None)
+    is_pdf = file_type == "pdf" or file_name.lower().endswith('.pdf')
+
+    try:
+        file_bytes = base64.b64decode(file_content_base64)
+    except Exception as e:
+        logging.error(f"Failed to decode Base64 string for file {file_name}: {e}")
+        return jsonify({"error": f"Invalid Base64 content. Detail: {e}"}), 400
+
+    extracted_records = []
+    client_code = None
+    company_name = None
+
+    # PDF HANDLING
+    if is_pdf:
+        pdf_format = detect_pdf_format(file_bytes)
+        if not pdf_format:
+            return jsonify({"error": "Unknown or unsupported PDF format."}), 400
+
+        # Run only enough of each parser to get client code
+        if pdf_format == "valeo_campinas":
+            extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
+        elif pdf_format == "valeo_nevers":
+            extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
+        elif pdf_format == "pierburg":
+            extracted_records = process_pierburg_pdf(file_bytes, file_name)
+        elif pdf_format == "nidec":
+            extracted_records = process_nidec_pdf(file_bytes, file_name)
+        else:
+            return jsonify({"error": "Unrecognized PDF format."}), 400
+
+    # CSV HANDLING
+    else:
+        try:
+            csv_text = decode_and_clean_csv(file_content_base64)
+            csv_io = io.StringIO(csv_text)
+            rows = list(csv.reader(csv_io, delimiter=';'))
+            header = [col.strip() for col in rows[0]]
+            rows_cleaned = [[cell.strip() for cell in row] for row in rows]
+            rows_cleaned[0] = header
+            rows = rows_cleaned
+        except Exception as e:
+            return jsonify({"error": f"CSV decoding failed: {e}"}), 400
+
+        company, header = detect_company_and_prepare(rows)
+        if company == "Valeo":
+            extracted_records = process_valeo_rows(rows, header)
+        elif company == "Inteva":
+            extracted_records = process_inteva_rows(rows, header)
+        elif company == "Nidec":
+            extracted_records = process_nidec_rows(rows, header)
+        else:
+            return jsonify({"error": "Unrecognized company type."}), 400
+
+    # Extract client code from first record
+    if extracted_records:
+        client_code = extracted_records[0].get("ClientCode", None)
+
+    # Map client code to company name
+    code_to_company = {
+        "C00409": "Valeo Nevers",
+        "C00072": "Valeo Brasil",
+        "C00285": "Pierburg",
+        "C00260": "Nidec Inde",
+        "C00113": "Nidec DCK",
+        "C00126": "Nidec Pologne",
+        "C00050": "Nidec ESP",
+        "C00241": "Inteva GAD",
+        "C00410": "Inteva Esson",
+        "C00250": "Valeo Poland",
+        "C00303": "Valeo Mexique",
+        "C00125": "Valeo Madrid",
+        "C00132": "Valeo Betigheim"
+    }
+    company_name = code_to_company.get(client_code, "Unknown")
+
+    forecast_date = None
+    if extracted_records:
+        forecast_date = extracted_records[0].get("ForecastDate")
+
+    # Sanitize for filename (YYYY-WXX or fallback)
+    safe_forecast = forecast_date if forecast_date else "unknown_week"
+
+    # Build suggested filename
+    suggested_name = f"{company_name.replace(' ', '_')}_edi_{safe_forecast}".lower()
+
+    return jsonify({
+        "file_processed": file_name,
+        "client_code": client_code,
+        "company_detected": company_name,
+        "forecast_week": forecast_date,
+        "records_detected": len(extracted_records),
+        "suggested_filename": suggested_name
+    }), 200
+
+
+
+
+
+
+
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5001,debug=True)
