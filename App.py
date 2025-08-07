@@ -1244,8 +1244,7 @@ def detect_client_info():
 
     file_name = data['file_name']
     file_content_base64 = data['file_content_base64']
-    file_type = data.get('file_type', None)
-    is_pdf = file_type == "pdf" or file_name.lower().endswith('.pdf')
+    is_pdf = file_name.lower().endswith('.pdf')
 
     try:
         file_bytes = base64.b64decode(file_content_base64)
