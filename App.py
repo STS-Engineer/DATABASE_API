@@ -1327,7 +1327,9 @@ def detect_client_info():
     safe_forecast = forecast_date if forecast_date else "unknown_week"
 
     # Build suggested filename
-    suggested_name = f"{company_name.replace(' ', '_')}_edi_{safe_forecast}".lower()
+    # Get file extension from the original name (default to .dat if unrecognized)
+    file_ext = os.path.splitext(file_name)[1] or ".dat"
+    suggested_name = f"{company_name.replace(' ', '_')}_edi_{safe_forecast}{file_ext}".lower()
 
     return jsonify({
         "file_processed": file_name,
