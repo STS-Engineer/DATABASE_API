@@ -12,6 +12,9 @@ from datetime import datetime ,date
 import re
 from collections import defaultdict
 import os
+from psycopg2.extras import execute_values
+from pdf2image import convert_from_bytes
+import pytesseract
 app = Flask(__name__)
 
 # Use your actual DATABASE_URL as an environment variable for better security!
@@ -1138,7 +1141,6 @@ def process_valeo_nevers_pdf(pdf_bytes, file_name):
 
 
 
-
 @app.route("/process-TunisiaSite", methods=['POST'])
 def process_file_endpoint():
     data = request.get_json()
@@ -1163,28 +1165,41 @@ def process_file_endpoint():
     header = None
 
     if is_pdf:
-        pdf_format = detect_pdf_format(file_bytes)
-        if not pdf_format:
-            return jsonify({"error": "Unknown or unsupported PDF format."}), 400
-
-        if pdf_format == "valeo_campinas":
-            extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
-            company = "Valeo VWS Campinas"
-
-        elif pdf_format == "valeo_nevers":
-            extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
-            company = "Valeo CIE Nevers"
-
-        elif pdf_format == "pierburg":
-            extracted_records = process_pierburg_pdf(file_bytes, file_name)
-            company = "Pierburg"
-
-        elif pdf_format == "nidec":
-            extracted_records = process_nidec_pdf(file_bytes, file_name)
-            company = "Nidec"
-
+        if is_scanned_pdf(file_bytes):
+            ocr_text = run_ocr_on_pdf(file_bytes)
+            detected_format = detect_scanned_pdf_format(ocr_text)
+            if detected_format == "spain":
+                extracted_records = process_spain_platform_ocr(ocr_text)
+                company = "Spain Platform"
+            elif detected_format == "poland":
+                extracted_records = process_poland_platform_ocr(ocr_text)
+                company = "Poland Platform"
+            else:
+                return jsonify({"error": "Unrecognized scanned PDF format."}), 400
         else:
-            return jsonify({"error": "Unrecognized PDF format."}), 400
+
+            pdf_format = detect_pdf_format(file_bytes)
+            if not pdf_format:
+                return jsonify({"error": "Unknown or unsupported PDF format."}), 400
+
+            if pdf_format == "valeo_campinas":
+                extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
+                company = "Valeo VWS Campinas"
+
+            elif pdf_format == "valeo_nevers":
+                extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
+                company = "Valeo CIE Nevers"
+
+            elif pdf_format == "pierburg":
+                extracted_records = process_pierburg_pdf(file_bytes, file_name)
+                company = "Pierburg"
+
+            elif pdf_format == "nidec":
+                extracted_records = process_nidec_pdf(file_bytes, file_name)
+                company = "Nidec"
+
+            else:
+                return jsonify({"error": "Unrecognized PDF format."}), 400
 
 
     else:
@@ -1234,6 +1249,87 @@ def process_file_endpoint():
 
 
 
+
+def is_scanned_pdf(file_bytes: bytes, file_name: str) -> tuple:
+    """
+    Analyse un PDF pour détecter s'il est scanné (aucun texte extractible).
+    Retourne un tuple (json_response, http_status) pour envoi direct.
+    """
+    try:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            for page in doc:
+                if page.get_text("text").strip():
+                    # PDF non scanné
+                    return None, None  # On renvoie None pour signaler que ce n'est pas un scan
+
+        # Si on est ici, c’est un PDF scanné
+        file_ext = os.path.splitext(file_name)[1] or ".pdf"
+        suggested_name = f"scanned_pdf_{os.path.splitext(file_name)[0]}{file_ext}".lower()
+
+        payload = {
+            "file_processed": file_name,
+            "client_code": "SCANNED",
+            "company_detected": "Unknown",
+            "forecast_week": None,
+            "records_detected": 0,
+            "suggested_filename": suggested_name,
+            "reason": "pdf_scanned_no_text",
+            "file_type": "pdf",
+            "is_scanned": True
+        }
+        return jsonify(payload), 200
+
+    except Exception as e:
+        logging.warning(f"is_scanned_pdf failed to process {file_name}: {e}")
+        file_ext = os.path.splitext(file_name)[1] or ".pdf"
+        payload = {
+            "file_processed": file_name,
+            "client_code": "UNRECOGNIZED",
+            "company_detected": "Unknown",
+            "forecast_week": None,
+            "records_detected": 0,
+            "suggested_filename": f"unknown_pdf_error{file_ext}",
+            "reason": "pdf_read_error",
+            "file_type": "pdf",
+            "is_scanned": None
+        }
+        return jsonify(payload), 200
+
+
+
+
+
+
+def build_unknown_response(
+    file_name: str,
+    file_ext: str,
+    reason: str,
+    file_type: str,
+    is_scanned: bool = None,
+) -> tuple:
+    """
+    Create a consistent JSON for unrecognized inputs that callers can route.
+    Returns (json, 200).
+    """
+    safe_reason = reason.replace(" ", "_").lower()
+    suggested_name = f"unknown_edi_{safe_reason}{file_ext}".lower()
+    payload = {
+        "file_processed": file_name,
+        "client_code": "UNRECOGNIZED",
+        "company_detected": "Unknown",
+        "forecast_week": None,
+        "records_detected": 0,
+        "suggested_filename": suggested_name,
+        "reason": reason,
+        "file_type": file_type,
+    }
+    if is_scanned is not None:
+        payload["is_scanned"] = is_scanned
+    return jsonify(payload), 200
+
+
+
+
 @app.route("/detect-client-info", methods=["POST"])
 def detect_client_info():
     data = request.get_json()
@@ -1244,64 +1340,137 @@ def detect_client_info():
 
     file_name = data['file_name']
     file_content_base64 = data['file_content_base64']
+    file_ext = os.path.splitext(file_name)[1] or ".dat"
     is_pdf = file_name.lower().endswith('.pdf')
 
     try:
         file_bytes = base64.b64decode(file_content_base64)
     except Exception as e:
         logging.error(f"Failed to decode Base64 string for file {file_name}: {e}")
+        # Keep 400 here: the content is actually corrupt base64, not just unrecognized.
         return jsonify({"error": f"Invalid Base64 content. Detail: {e}"}), 400
 
     extracted_records = []
     client_code = None
     company_name = None
+    scanned_flag = None  # set only for PDFs
 
-    # PDF HANDLING
+    # ---------- PDF HANDLING ----------
     if is_pdf:
+        # New behavior: is_scanned_pdf returns (json_response, http_status) if scanned, else (None, None)
+        scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
+        if scan_resp is not None:
+            # It is a scanned PDF (or unreadable) → return routing JSON immediately
+            return scan_resp, scan_status
+
+        scanned_flag = False  # explicitly mark as not scanned
+
         pdf_format = detect_pdf_format(file_bytes)
         if not pdf_format:
-            return jsonify({"error": "Unknown or unsupported PDF format."}), 400
+            # Unrecognized text structure; still tell caller it's a PDF and not scanned
+            return build_unknown_response(
+                file_name=file_name,
+                file_ext=file_ext,
+                reason="unrecognized_pdf_format",
+                file_type="pdf",
+                is_scanned=scanned_flag,
+            )
 
-        # Run only enough of each parser to get client code
-        if pdf_format == "valeo_campinas":
-            extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
-        elif pdf_format == "valeo_nevers":
-            extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
-        elif pdf_format == "pierburg":
-            extracted_records = process_pierburg_pdf(file_bytes, file_name)
-        elif pdf_format == "nidec":
-            extracted_records = process_nidec_pdf(file_bytes, file_name)
-        else:
-            return jsonify({"error": "Unrecognized PDF format."}), 400
+        # Try parsers (note: they may still return 0 records if the layout changes)
+        try:
+            if pdf_format == "valeo_campinas":
+                extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
+            elif pdf_format == "valeo_nevers":
+                extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
+            elif pdf_format == "pierburg":
+                extracted_records = process_pierburg_pdf(file_bytes, file_name)
+            elif pdf_format == "nidec":
+                extracted_records = process_nidec_pdf(file_bytes, file_name)
+            else:
+                return build_unknown_response(
+                    file_name=file_name,
+                    file_ext=file_ext,
+                    reason="unrecognized_pdf_format",
+                    file_type="pdf",
+                    is_scanned=scanned_flag,
+                )
+        except Exception as e:
+            logging.warning(f"PDF parsing error for {file_name}: {e}")
+            # Parsing blew up → we still return a routable unknown response
+            return build_unknown_response(
+                file_name=file_name,
+                file_ext=file_ext,
+                reason="pdf_parse_error",
+                file_type="pdf",
+                is_scanned=scanned_flag,
+            )
 
-    # CSV HANDLING
+    # ---------- CSV HANDLING ----------
     else:
         try:
             csv_text = decode_and_clean_csv(file_content_base64)
             csv_io = io.StringIO(csv_text)
             rows = list(csv.reader(csv_io, delimiter=';'))
+
+            if not rows or not rows[0]:
+                return build_unknown_response(
+                    file_name=file_name,
+                    file_ext=file_ext,
+                    reason="empty_or_invalid_csv",
+                    file_type="csv",
+                )
+
             header = [col.strip() for col in rows[0]]
             rows_cleaned = [[cell.strip() for cell in row] for row in rows]
             rows_cleaned[0] = header
             rows = rows_cleaned
         except Exception as e:
-            return jsonify({"error": f"CSV decoding failed: {e}"}), 400
+            # CSV unreadable → caller can route it elsewhere
+            return build_unknown_response(
+                file_name=file_name,
+                file_ext=file_ext,
+                reason="csv_decoding_failed",
+                file_type="csv",
+            )
 
         company, header = detect_company_and_prepare(rows)
-        if company == "Valeo":
-            extracted_records = process_valeo_rows(rows, header)
-        elif company == "Inteva":
-            extracted_records = process_inteva_rows(rows, header)
-        elif company == "Nidec":
-            extracted_records = process_nidec_rows(rows, header)
-        else:
-            return jsonify({"error": "Unrecognized company type."}), 400
+        if not company:
+            return build_unknown_response(
+                file_name=file_name,
+                file_ext=file_ext,
+                reason="unrecognized_csv_format",
+                file_type="csv",
+            )
+
+        try:
+            if company == "Valeo":
+                extracted_records = process_valeo_rows(rows, header)
+            elif company == "Inteva":
+                extracted_records = process_inteva_rows(rows, header)
+            elif company == "Nidec":
+                extracted_records = process_nidec_rows(rows, header)
+            else:
+                return build_unknown_response(
+                    file_name=file_name,
+                    file_ext=file_ext,
+                    reason="unrecognized_company_type",
+                    file_type="csv",
+                )
+        except Exception as e:
+            logging.warning(f"CSV parsing error for {file_name}: {e}")
+            return build_unknown_response(
+                file_name=file_name,
+                file_ext=file_ext,
+                reason="csv_parse_error",
+                file_type="csv",
+            )
+
+    # ---------- Produce recognized response (or fallback if no records) ----------
 
     # Extract client code from first record
     if extracted_records:
         client_code = extracted_records[0].get("ClientCode", None)
 
-    # Map client code to company name
     code_to_company = {
         "C00409": "Valeo Nevers",
         "C00072": "Valeo Brasil",
@@ -1317,28 +1486,87 @@ def detect_client_info():
         "C00125": "Valeo Madrid",
         "C00132": "Valeo Betigheim"
     }
-    company_name = code_to_company.get(client_code, "Unknown")
+    company_name = code_to_company.get(client_code, "Unknown") if client_code else "Unknown"
+    forecast_date = extracted_records[0].get("ForecastDate") if extracted_records else None
+    suggested_name = f"{company_name.replace(' ', '_')}_edi_{(forecast_date or 'unknown_week')}{file_ext}".lower()
 
-    forecast_date = None
-    if extracted_records:
-        forecast_date = extracted_records[0].get("ForecastDate")
-
-    # Sanitize for filename (YYYY-WXX or fallback)
-    safe_forecast = forecast_date if forecast_date else "unknown_week"
-
-    # Build suggested filename
-    # Get file extension from the original name (default to .dat if unrecognized)
-    file_ext = os.path.splitext(file_name)[1] or ".dat"
-    suggested_name = f"{company_name.replace(' ', '_')}_edi_{safe_forecast}{file_ext}".lower()
-
-    return jsonify({
+    payload = {
         "file_processed": file_name,
-        "client_code": client_code,
+        "client_code": client_code if client_code else "UNRECOGNIZED",
         "company_detected": company_name,
         "forecast_week": forecast_date,
         "records_detected": len(extracted_records),
-        "suggested_filename": suggested_name
-    }), 200
+        "suggested_filename": suggested_name,
+        "file_type": "pdf" if is_pdf else "csv",
+    }
+    if scanned_flag is not None:
+        payload["is_scanned"] = scanned_flag
+
+    # If we got no records even though the format is known, mark it explicitly
+    if not extracted_records:
+        payload["reason"] = "recognized_but_no_records"
+
+    return jsonify(payload), 200
+
+
+
+
+
+
+
+
+def run_ocr_on_pdf(file_bytes: bytes) -> str:
+    images = convert_from_bytes(file_bytes)
+    full_text = ""
+    for img in images:
+        text = pytesseract.image_to_string(img, lang='eng')
+        full_text += text + "\n"
+    return full_text
+
+
+def detect_scanned_pdf_format(ocr_text: str) -> str | None:
+    text_lower = ocr_text.lower()
+    if "albaran" in text_lower:
+        return "spain"
+    elif "poland" in text_lower:
+        return "poland"
+    else:
+        return None
+
+
+
+def save_delivery_details_to_db(records: list[dict]) -> tuple[int, list[str]]:
+    conn = psycopg2.connect(os.getenv("POSTGRES_CONN_STR"))
+    cursor = conn.cursor()
+    inserted = 0
+    errors = []
+    for record in records:
+        try:
+            cursor.execute("""
+                INSERT INTO public."DeliveryDetails"
+                ("Site", "ClientMaterialNo", "AVOMaterialNo", "DeliveryNo", "Quantity", "Date", "Status")
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (
+                record["Site"],
+                record["ClientMaterialNo"],
+                record["AVOMaterialNo"],
+                record["DeliveryNo"],
+                record["Quantity"],
+                record["Date"],
+                record["Status"]
+            ))
+            inserted += 1
+        except Exception as e:
+            errors.append(str(e))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return inserted, errors
+
+
+
+
 
 
 
