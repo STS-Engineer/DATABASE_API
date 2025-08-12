@@ -1322,12 +1322,11 @@ def build_unknown_response(
         "suggested_filename": suggested_name,
         "reason": reason,
         "file_type": file_type,
+        "file_recognition": False  # Always false for unknown files
     }
     if is_scanned is not None:
         payload["is_scanned"] = is_scanned
     return jsonify(payload), 200
-
-
 
 
 @app.route("/detect-client-info", methods=["POST"])
@@ -1347,7 +1346,6 @@ def detect_client_info():
         file_bytes = base64.b64decode(file_content_base64)
     except Exception as e:
         logging.error(f"Failed to decode Base64 string for file {file_name}: {e}")
-        # Keep 400 here: the content is actually corrupt base64, not just unrecognized.
         return jsonify({"error": f"Invalid Base64 content. Detail: {e}"}), 400
 
     extracted_records = []
@@ -1357,17 +1355,13 @@ def detect_client_info():
 
     # ---------- PDF HANDLING ----------
     if is_pdf:
-        # New behavior: is_scanned_pdf returns (json_response, http_status) if scanned, else (None, None)
         scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
         if scan_resp is not None:
-            # It is a scanned PDF (or unreadable) → return routing JSON immediately
             return scan_resp, scan_status
 
-        scanned_flag = False  # explicitly mark as not scanned
-
+        scanned_flag = False
         pdf_format = detect_pdf_format(file_bytes)
         if not pdf_format:
-            # Unrecognized text structure; still tell caller it's a PDF and not scanned
             return build_unknown_response(
                 file_name=file_name,
                 file_ext=file_ext,
@@ -1376,7 +1370,6 @@ def detect_client_info():
                 is_scanned=scanned_flag,
             )
 
-        # Try parsers (note: they may still return 0 records if the layout changes)
         try:
             if pdf_format == "valeo_campinas":
                 extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
@@ -1396,7 +1389,6 @@ def detect_client_info():
                 )
         except Exception as e:
             logging.warning(f"PDF parsing error for {file_name}: {e}")
-            # Parsing blew up → we still return a routable unknown response
             return build_unknown_response(
                 file_name=file_name,
                 file_ext=file_ext,
@@ -1425,7 +1417,6 @@ def detect_client_info():
             rows_cleaned[0] = header
             rows = rows_cleaned
         except Exception as e:
-            # CSV unreadable → caller can route it elsewhere
             return build_unknown_response(
                 file_name=file_name,
                 file_ext=file_ext,
@@ -1465,9 +1456,7 @@ def detect_client_info():
                 file_type="csv",
             )
 
-    # ---------- Produce recognized response (or fallback if no records) ----------
-
-    # Extract client code from first record
+    # ---------- Produce recognized response ----------
     if extracted_records:
         client_code = extracted_records[0].get("ClientCode", None)
 
@@ -1498,77 +1487,14 @@ def detect_client_info():
         "records_detected": len(extracted_records),
         "suggested_filename": suggested_name,
         "file_type": "pdf" if is_pdf else "csv",
+        "file_recognition": True if extracted_records else False  # true only if recognized & has records
     }
     if scanned_flag is not None:
         payload["is_scanned"] = scanned_flag
-
-    # If we got no records even though the format is known, mark it explicitly
     if not extracted_records:
         payload["reason"] = "recognized_but_no_records"
 
     return jsonify(payload), 200
-
-
-
-
-
-
-
-
-def run_ocr_on_pdf(file_bytes: bytes) -> str:
-    images = convert_from_bytes(file_bytes)
-    full_text = ""
-    for img in images:
-        text = pytesseract.image_to_string(img, lang='eng')
-        full_text += text + "\n"
-    return full_text
-
-
-def detect_scanned_pdf_format(ocr_text: str) -> str | None:
-    text_lower = ocr_text.lower()
-    if "albaran" in text_lower:
-        return "spain"
-    elif "poland" in text_lower:
-        return "poland"
-    else:
-        return None
-
-
-
-def save_delivery_details_to_db(records: list[dict]) -> tuple[int, list[str]]:
-    conn = psycopg2.connect(os.getenv("POSTGRES_CONN_STR"))
-    cursor = conn.cursor()
-    inserted = 0
-    errors = []
-    for record in records:
-        try:
-            cursor.execute("""
-                INSERT INTO public."DeliveryDetails"
-                ("Site", "ClientMaterialNo", "AVOMaterialNo", "DeliveryNo", "Quantity", "Date", "Status")
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (
-                record["Site"],
-                record["ClientMaterialNo"],
-                record["AVOMaterialNo"],
-                record["DeliveryNo"],
-                record["Quantity"],
-                record["Date"],
-                record["Status"]
-            ))
-            inserted += 1
-        except Exception as e:
-            errors.append(str(e))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return inserted, errors
-
-
-
-
-
-
 
 
 
