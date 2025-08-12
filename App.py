@@ -13,8 +13,6 @@ import re
 from collections import defaultdict
 import os
 from psycopg2.extras import execute_values
-from pdf2image import convert_from_bytes
-import pytesseract
 app = Flask(__name__)
 
 # Use your actual DATABASE_URL as an environment variable for better security!
@@ -117,14 +115,11 @@ def process_valeo_rows(rows, header):
                 week_num += 1
             forecast_date = f"{date_obj.year}-W{week_num:02d}"
             material_code = row[idx['Material_No_Customer']].strip()
-            if not material_code.startswith("V"):
-                AVOmaterial_code = "V" + material_code
+            AVOmaterial_code = material_code if material_code.startswith("V") else "V" + material_code
             if client_code == "C00250":
-                AVOmaterial_code = AVOmaterial_code + "POL"
+                AVOmaterial_code += "POL"
             elif client_code == "C00303":
-                AVOmaterial_code = AVOmaterial_code + "SLP"
-            else : 
-                AVOmaterial_code = AVOmaterial_code
+                AVOmaterial_code += "SLP"
             processed.append({
                 "Site": "Tunisia",
                 "ClientCode": client_code,
@@ -152,11 +147,18 @@ def process_valeo_rows(rows, header):
     logging.warning(f"DEBUG: Valeo processed {len(processed)} records from {len(rows)-1} data rows")
     return processed
 
+
+
+
+
 def extract_material_code(val):
     match = re.match(r"(\d+)", val)
     if match:
         return f"{match.group(1)}"
     return ""
+
+
+
 
 
 def parse_date_flexible(date_str):
@@ -1166,15 +1168,15 @@ def process_file_endpoint():
 
     if is_pdf:
         if is_scanned_pdf(file_bytes):
-            ocr_text = run_ocr_on_pdf(file_bytes)
-            detected_format = detect_scanned_pdf_format(ocr_text)
-            if detected_format == "spain":
-                extracted_records = process_spain_platform_ocr(ocr_text)
-                company = "Spain Platform"
-            elif detected_format == "poland":
-                extracted_records = process_poland_platform_ocr(ocr_text)
-                company = "Poland Platform"
-            else:
+           # ocr_text = run_ocr_on_pdf(file_bytes)
+           # detected_format = detect_scanned_pdf_format(ocr_text)
+           # if detected_format == "spain":
+           #     extracted_records = process_spain_platform_ocr(ocr_text)
+           #     company = "Spain Platform"
+           # elif detected_format == "poland":
+           #     extracted_records = process_poland_platform_ocr(ocr_text)
+           #     company = "Poland Platform"
+           # else:
                 return jsonify({"error": "Unrecognized scanned PDF format."}), 400
         else:
 
