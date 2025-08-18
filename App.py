@@ -13,6 +13,8 @@ import re
 from collections import defaultdict
 import os
 from psycopg2.extras import execute_values
+from PyPDF2 import PdfReader
+
 app = Flask(__name__)
 
 # Use your actual DATABASE_URL as an environment variable for better security!
@@ -126,7 +128,7 @@ def process_valeo_rows(rows, header):
                 "ClientMaterialNo": material_code,
                 "AVOMaterialNo": AVOmaterial_code,
                 "DateFrom": to_forecast_week(delivery_date),
-                "DateUntil": to_forecast_week(delivery_date),
+                "DateUntil": delivery_date,
                 "Quantity": int(row[idx['Despatch_Qty']].strip() or 0),
                 "ForecastDate": to_forecast_week(date_str),
                 "LastDeliveryDate": to_forecast_week(row[idx['Last_Delivery_Note_Date']].strip()),
@@ -166,6 +168,7 @@ def parse_date_flexible(date_str):
     formats = [
         "%Y-%m-%d",   # e.g. 2025-07-03
         "%d.%m.%Y",   # e.g. 03.07.2025
+        "%d.%m.%y",
         "%d/%m/%Y",   # e.g. 03/07/2025
         "%d/%m/%y",   # e.g. 03/07/25 ← important!
         "%Y/%m/%d",   # e.g. 2025/07/03
@@ -1165,9 +1168,9 @@ def process_file_endpoint():
     extracted_records = []
     company = None
     header = None
-
+    scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
     if is_pdf:
-        if is_scanned_pdf(file_bytes):
+        if scan_resp is not None:
            # ocr_text = run_ocr_on_pdf(file_bytes)
            # detected_format = detect_scanned_pdf_format(ocr_text)
            # if detected_format == "spain":
@@ -1498,6 +1501,409 @@ def detect_client_info():
 
     return jsonify(payload), 200
 
+######################################################################################################################################
+
+
+def process_valeo_de_csv_rows(rows, header):
+    processed = []
+
+    plant_to_client = {
+        "CZ22": "100442", 
+        "FUEN": "100541", 
+        "KJ01": "100506", 
+        "CA02": "100573",
+        "ET01": "100523"
+    }
+
+    valeo_de_product_map = {
+        "190313": "1023093",
+        "191663": "1023645",
+        "187144": "1026188",
+        "194470": "1026258",
+        "202066": "1026540",
+        "214188": "1026629",
+        "471550":  "1026325",
+        "478537":  "1026365",
+        "470737":  "1026384"
+
+    }
+
+    idx = {col: header.index(col) for col in header}
+
+    for row in rows[1:]:
+        try:
+            if 'Customer_No' in idx and not row[idx['Customer_No']].isnumeric():
+                continue
+
+            plant = row[idx['Plant_No']].strip()
+            client_code = plant_to_client.get(plant)
+            if not client_code:
+                logging.warning(f"[Valeo DE CSV] Skipping row — Unknown plant: {plant}")
+                continue
+
+            material_code = row[idx['Material_No_Customer']].strip()
+            AVOmaterial_code = valeo_de_product_map.get(material_code.lstrip("0"))
+
+            if not AVOmaterial_code:
+                logging.warning(f"[Valeo DE CSV] Skipping row — No AVO mapping for material: {material_code}")
+                continue
+
+            delivery_date = row[idx['Delivery_Date']].strip()
+            date_str = row[idx['Date']].strip()
+
+            try:
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+
+            week_num = date_obj.isocalendar()[1]
+            if date_obj.weekday() > 1:
+                week_num += 1
+            forecast_date = f"{date_obj.year}-W{week_num:02d}"
+
+            processed.append({
+                "Site": "Germany",
+                "ClientCode": client_code,
+                "ClientMaterialNo": material_code,
+                "AVOMaterialNo": AVOmaterial_code,
+                "DateFrom": to_forecast_week(delivery_date),
+                "DateUntil": delivery_date,
+                "Quantity": int(row[idx['Despatch_Qty']].strip() or 0),
+                "ForecastDate": to_forecast_week(date_str),
+                "LastDeliveryDate": to_forecast_week(row[idx['Last_Delivery_Note_Date']].strip()),
+                "LastDeliveredQuantity": int(row[idx['Last_Delivery_Quantity']].strip() or 0),
+                "CumulatedQuantity": int(row[idx['Cum_Quantity']].strip() or 0),
+                "EDIStatus": {
+                    "p": "Forecast",
+                    "P": "Forecast",
+                    "f": "Firm",
+                    "F": "Firm"
+                }.get(row[idx['Commitment_Level']].strip(), row[idx['Commitment_Level']].strip()),
+                "ProductName": row[idx['Description']].strip(),
+                "LastDeliveryNo": row[idx['Last_Delivery_Note']].strip()
+            })
+        except Exception as e:
+            logging.error(f"[Valeo DE CSV] Row processing error: {e}")
+
+    logging.warning(f"[Valeo DE CSV] Processed {len(processed)} records from {len(rows)-1} rows")
+    return processed
+
+
+
+def process_nidec_de_csv_rows(rows, header):
+    plant_to_client = {
+        "ZI01": "100420",  # Nidec Poland - Germany site
+    }
+
+    material_map = {
+        "471-695-99-99": "1022201",
+        "503-660-99-99": "1027700"
+    }
+
+    processed = []
+    idx = {col: header.index(col) for col in header}
+
+    required_fields = ['Plant', 'CallOffDate', 'Material', 'DateFrom', 'DateUntil', 
+                       'DespatchQty', 'LastDeliveryDate', 'LastDeliveryQuantity', 
+                       'CumQuantity', 'Status', 'LastDeliveryNo']
+    for f in required_fields:
+        if f not in idx:
+            logging.error(f"Column missing in Nidec DE CSV: {f}")
+            return []
+
+    for i, row in enumerate(rows[1:], 1):
+        try:
+            if len(row) < len(header):
+                row += [""] * (len(header) - len(row))
+
+            plant = row[idx['Plant']].strip()
+            if plant not in plant_to_client:
+                logging.warning(f"[Nidec DE CSV] SKIP row {i}: Unknown plant '{plant}'")
+                continue
+
+            client_code = plant_to_client[plant]
+            call_off_date_str = row[idx['CallOffDate']].strip()
+
+            if not call_off_date_str:
+                logging.warning(f"[Nidec DE CSV] SKIP row {i}: Empty CallOffDate")
+                continue
+
+            try:
+                date_obj = datetime.strptime(call_off_date_str, "%Y-%m-%d")
+            except ValueError:
+                try:
+                    date_obj = datetime.strptime(call_off_date_str, "%d.%m.%Y")
+                except ValueError:
+                    logging.warning(f"[Nidec DE CSV] SKIP row {i}: Unparsable CallOffDate '{call_off_date_str}'")
+                    continue
+
+            week_num = date_obj.isocalendar()[1]
+            if date_obj.weekday() > 1:
+                week_num += 1
+            forecast_date = f"{date_obj.year}-W{week_num:02d}"
+
+            material_code = row[idx['Material']].strip()
+            avo_material_code = material_map.get(material_code)
+
+            if not avo_material_code:
+                logging.warning(f"[Nidec DE CSV] SKIP row {i}: No AVO mapping for material '{material_code}'")
+                continue
+
+            processed.append({
+                "Site": "Germany",
+                "ClientCode": client_code,
+                "ClientMaterialNo": material_code,
+                "AVOMaterialNo": avo_material_code,
+                "DateFrom": to_forecast_week(row[idx['DateFrom']].strip()),
+                "DateUntil": row[idx['DateUntil']].strip(),
+                "Quantity": parse_euro_number(row[idx['DespatchQty']].strip()),
+                "ForecastDate": forecast_date,
+                "LastDeliveryDate": to_forecast_week(row[idx['LastDeliveryDate']].strip()),
+                "LastDeliveredQuantity": parse_euro_number(row[idx['LastDeliveryQuantity']].strip()),
+                "CumulatedQuantity": parse_euro_number(row[idx['CumQuantity']].strip()),
+                "EDIStatus": row[idx['Status']].strip(),
+                "ProductName": None,
+                "LastDeliveryNo": row[idx['LastDeliveryNo']].strip()
+            })
+
+        except Exception as e:
+            logging.error(f"[Nidec DE CSV] Row {i} processing error: {e}")
+
+    logging.warning(f"[Nidec DE CSV] Processed {len(processed)} records from {len(rows)-1} rows")
+    return processed
+
+
+def process_bosch_pdf(file_bytes, file_name):
+    text = parse_pdf(io.BytesIO(file_bytes))
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # Standortcode --> ClientCode
+    client_code = "UNKNOWN"
+    m = re.search(r"Standortcode\s*\(Kunde\):\s*(\w+)", text)
+    if m:
+        code = m.group(1)
+        site_code_to_client = {
+            "2570": "100409",
+            "5060": "100410",
+            "908A": "100327",
+            "526W": "100296"
+        }
+        client_code = site_code_to_client.get(code, "UNKNOWN")
+
+    # Material (Client)
+    material = re.search(r"Material:\s*([0-9A-Za-z\-]+)", text)
+    material = material.group(1) if material else ""
+
+    # ProductName
+    product_name = re.search(r"Materialbeschreibung\s*\(Kunde\):\s*([^\n]+)", text)
+    product_name = product_name.group(1).strip() if product_name else ""
+
+    # LastDeliveryNo
+    last_delivery_no = re.search(r"Lieferscheinnummer:?\s*(\S+)", text)
+    last_delivery_no = last_delivery_no.group(1) if last_delivery_no else ""
+
+    # LastDeliveryDate and Qty
+    last_delivery_date = ""
+    last_delivered_qty = 0
+    m = re.search(r"Lieferscheinn(?:ummer|r).*?Datum:\s*(\d{2}\.\d{2}\.\d{2,4}).*?Menge:\s*([\d.]+)", text, re.DOTALL)
+    if m:
+        last_delivery_date = m.group(1)
+        last_delivered_qty = int(m.group(2).replace(".", ""))
+
+    # ForecastDate from akt. Lieferabrufnummer
+    forecast_date = ""
+    m = re.search(r"akt\. Lieferabrufnummer:.*?Datum:\s*(\d{2}\.\d{2}\.\d{2,4})", text)
+    if m:
+        forecast_date = m.group(1)
+
+    # Material Mappings
+    bosch_material_map = {
+        "1027599": "1582875601",
+        "1022031": "1582884102",
+        "1026644": "1394320515",
+        "1021731": "1394320230",
+        "1394320230":  "1021731",
+        "1394320228":  "1026021"
+
+    }
+    reverse_map = {v: k for k, v in bosch_material_map.items()}
+
+    client_material_no = "UNKNOWN"
+    avo_material_no = "UNKNOWN"
+    if material in bosch_material_map:
+        avo_material_no = material
+        client_material_no = bosch_material_map[material]
+    elif material in reverse_map:
+        avo_material_no = reverse_map[material]
+        client_material_no = material
+
+    # Line Patterns
+    pattern_with_times = re.compile(r"(\d{2}\.\d{2}\.\d{2})\s+(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2})\s+(\d{2}:\d{2})\s+([\d.,]+)\s+([\d.,]+)\s+(\w+)")
+    pattern_no_times = re.compile(r"(\d{2}\.\d{2}\.\d{2})\s+(\d{2}\.\d{2}\.\d{2})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)?\s*(\w+)")
+    pattern_short = re.compile(r"(\d{2}\.\d{2}\.\d{2})\s+([\d.,]+)\s+([\d.,]+)\s+(\w+)")
+
+    def convert_euro(val):
+        if not val: return 0
+        val = val.replace(".", "").replace(",", ".")
+        return int(float(val))
+
+    edi_status_map = {
+        "fix": "Firm",
+        "fertigung": "Firm",
+        "material": "Firm",
+        "vorschau": "Forecast"
+    }
+
+    records = []
+
+    for line in lines:
+        match = (
+            pattern_with_times.match(line) or
+            pattern_no_times.match(line) or
+            pattern_short.match(line)
+        )
+        if not match:
+            continue
+
+        if match.re is pattern_with_times:
+            _, _, abholtermin, _, liefermenge, efz, status = match.groups()
+        elif match.re is pattern_no_times:
+            _, abholtermin, liefermenge, efz, _, status = match.groups()
+        else:
+            abholtermin, liefermenge, efz, status = match.groups()
+
+        status = edi_status_map.get(status.strip().lower(), status.title())
+
+        records.append({
+            "Site": "Germany",
+            "ClientCode": client_code,
+            "ClientMaterialNo": client_material_no,
+            "AVOMaterialNo": avo_material_no,
+            "DateFrom": to_forecast_week(abholtermin),
+            "DateUntil": abholtermin,
+            "Quantity": convert_euro(liefermenge),
+            "ForecastDate": to_forecast_week(forecast_date),
+            "LastDeliveryNo": last_delivery_no,
+            "LastDeliveryDate": to_forecast_week(last_delivery_date),
+            "LastDeliveredQuantity": last_delivered_qty,
+            "CumulatedQuantity": convert_euro(efz),
+            "EDIStatus": status,
+            "ProductName": product_name,
+        })
+
+    return records
+
+
+def parse_pdf(file_bytes_io):
+    """
+    Parses a PDF from a BytesIO object using PyPDF2.
+    """
+    reader = PdfReader(file_bytes_io)
+    text = ''
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + '\n'
+    return text
+
+
+@app.route("/process-GermanySite", methods=['POST'])
+def process_file_endpoint_germany():
+    data = request.get_json()
+    required_keys = ['file_name', 'file_content_base64']
+    if not data or not all(k in data for k in required_keys):
+        missing_keys = [k for k in required_keys if k not in data]
+        return jsonify({"error": f"Missing keys in request body: {', '.join(missing_keys)}"}), 400
+
+    file_name = data['file_name']
+    file_content_base64 = data['file_content_base64']
+    file_type = data.get('file_type', None)
+    is_pdf = file_type == "pdf" or file_name.lower().endswith('.pdf')
+
+    try:
+        file_bytes = base64.b64decode(file_content_base64)
+    except Exception as e:
+        logging.error(f"Failed to decode Base64 string for file {file_name}: {e}")
+        return jsonify({"error": f"Invalid Base64 content. Detail: {e}"}), 400
+
+    extracted_records = []
+    company = None
+    header = None
+
+    if not is_pdf:
+        try:
+            logging.warning(f"DEBUG: first 100 b64 chars: {file_content_base64[:100]}")
+            csv_text = decode_and_clean_csv(file_content_base64)
+            csv_io = io.StringIO(csv_text)
+            rows = list(csv.reader(csv_io, delimiter=';'))
+
+            header = [col.strip() for col in rows[0]]
+            rows_cleaned = []
+            for row in rows:
+                cleaned_row = [cell.strip() for cell in row]
+                while cleaned_row and cleaned_row[-1] == '':
+                    cleaned_row.pop()
+                rows_cleaned.append(cleaned_row)
+            rows = rows_cleaned
+            rows[0] = header
+        except Exception as e:
+            logging.error(f"Failed to decode and clean Base64 string for file {file_name}: {e}")
+            return jsonify({"error": f"Invalid Base64 content. Detail: {e}"}), 400
+
+        company, header = detect_company_and_prepare(rows)
+        if not company:
+            return jsonify({"error": "Unknown or unsupported CSV format."}), 400
+
+        if company == "Valeo":
+            extracted_records = process_valeo_de_csv_rows(rows, header)
+        elif company == "Inteva":
+            extracted_records = process_inteva_rows(rows, header)  # Optional: Replace if you want DE-specific Inteva logic
+        elif company == "Nidec":
+            extracted_records = process_nidec_de_csv_rows(rows, header)   # Optional: Replace if you want DE-specific Nidec logic
+        else:
+            return jsonify({"error": "Unrecognized company type."}), 400
+
+    elif is_pdf:
+        try:
+            logging.warning(f"DEBUG: first 100 b64 chars: {file_content_base64[:100]}")
+            file_bytes = base64.b64decode(file_content_base64)
+            file = io.BytesIO(file_bytes)
+            text = parse_pdf(file)
+
+            if "Standortcode (Kunde):" in text:
+                match = re.search(r"Standortcode\s*\(Kunde\):\s*(\w+)", text)
+                if match:
+                    bosch_code = match.group(1)
+                    company="BOSCH"
+                    bosch_code_to_client = {
+                        "2570": "100409",
+                        "5060": "100410",
+                        "908A": "100327",
+                        "526W": "100296"
+                    }
+                    client_code = bosch_code_to_client.get(bosch_code)
+                    if not client_code:
+                        return jsonify({"error": f"Unrecognized BOSCH Standortcode: {bosch_code}"}), 400
+
+                    extracted_records = process_bosch_pdf(file_bytes, file_name)
+                else:
+                    return jsonify({"error": "Could not extract Standortcode (Kunde) from Bosch PDF."}), 400
+            else:
+                return jsonify({"error": "Unrecognized PDF format – Bosch header not found."}), 400
+
+        except Exception as e:
+            logging.exception("Error processing PDF file:")
+            return jsonify({"error": f"Failed to process PDF. Detail: {str(e)}"}), 400
+    success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
+    return jsonify({
+        "message": "Germany processing completed.",
+        "file_processed": file_name,
+        "company_detected": company,
+        "records_processed": len(extracted_records),
+        "records_inserted": success_count,
+        "records_failed": len(error_details),
+        "errors": error_details
+    }), (200 if success_count > 0 else 400)
 
 
 
