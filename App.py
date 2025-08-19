@@ -1908,5 +1908,319 @@ def process_file_endpoint_germany():
 
 
 
+
+
+
+
+# ========================= EDI ANALYSIS HELPERS =========================
+import re
+from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+
+WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")  # e.g., 2025-W07
+
+def norm_week_str(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = str(s).strip()
+    if len(s) >= 7 and s[4] == "-" and s[5] in ("W", "w"):
+        year, wk = s[:4], s[6:]
+        if wk.isdigit():
+            return f"{year}-W{wk.zfill(2)}"
+    return None
+
+def parse_year_week(s: str) -> Optional[Tuple[int, int]]:
+    s = norm_week_str(s)
+    if not s:
+        return None
+    try:
+        return int(s[:4]), int(s[-2:])
+    except Exception:
+        return None
+
+def week_order_key(s: str):
+    t = parse_year_week(s)
+    return t if t else (0, 0)
+
+def week_diff(a: str, b: str) -> Optional[int]:
+    ta = parse_year_week(a); tb = parse_year_week(b)
+    if not ta or not tb:
+        return None
+    (ya, wa), (yb, wb) = ta, tb
+    return (ya - yb) * 52 + (wa - wb)
+
+def get_interval(week_diff_val: Optional[int]) -> str:
+    if week_diff_val is None: return "Invalid Date Format"
+    if week_diff_val <= 0:   return "W-1 to W"
+    if week_diff_val == 1:   return "W+1"
+    if 2 <= week_diff_val <= 5:   return "W+2 to W+5"
+    if 6 <= week_diff_val <= 14:  return "W+6 to W+14"
+    if 15 <= week_diff_val <= 24: return "W+15 to W+24"
+    if week_diff_val >= 25:  return "W+25 and more"
+    return "Other"
+
+def get_allowed_change(interval: str) -> int:
+    return {
+        "W-1 to W": 0, "W+1": 0, "W+2 to W+5": 5,
+        "W+6 to W+14": 10, "W+15 to W+24": 15, "W+25 and more": 20
+    }.get(interval, 0)
+
+def group_and_sum(rows: List[dict], group_keys: List[str], sum_key: str) -> List[dict]:
+    grouped = defaultdict(float)
+    for row in rows:
+        key = tuple(row.get(k) for k in group_keys)
+        try:
+            grouped[key] += float(row.get(sum_key, 0) or 0)
+        except (ValueError, TypeError):
+            pass
+    out = []
+    for key, total in grouped.items():
+        base = dict(zip(group_keys, key))
+        base[sum_key] = total
+        out.append(base)
+    return out
+
+# ========================= DB FETCHERS =========================
+def fetch_ediglobal(
+    weeks: List[str],
+    client_codes: Optional[List[str]],
+    product_codes: Optional[List[str]],
+    sites: Optional[List[str]],
+) -> List[dict]:
+    fields = '"Site","ClientCode","AVOMaterialNo","DateFrom","ForecastDate","Quantity"'
+    sql = f'SELECT {fields} FROM "EDIGlobal" WHERE "ForecastDate" = ANY(%s)'
+    params: List[Any] = [weeks]
+
+    if client_codes:
+        sql += ' AND "ClientCode" = ANY(%s)'
+        params.append(client_codes)
+    if product_codes:
+        sql += ' AND "AVOMaterialNo" = ANY(%s)'
+        params.append(product_codes)
+    if sites:
+        sql += ' AND "Site" = ANY(%s)'
+        params.append(sites)
+
+    conn = get_pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def fetch_deliverydetails(
+    weeks: List[str],
+    product_codes: Optional[List[str]],
+    sites: Optional[List[str]],
+) -> List[dict]:
+    fields = '"Site","AVOMaterialNo","ClientMaterialNo","Date","Status","Quantity"'
+    sql = f'''
+        SELECT {fields}
+        FROM "DeliveryDetails"
+        WHERE "Status" = 'In Transit'
+          AND "Date" = ANY(%s)
+    '''
+    params: List[Any] = [weeks]
+    if product_codes:
+        sql += ' AND "AVOMaterialNo" = ANY(%s)'
+        params.append(product_codes)
+    if sites:
+        sql += ' AND "Site" = ANY(%s)'
+        params.append(sites)
+
+    conn = get_pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+# ========================= CORE ANALYSIS =========================
+def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[str, Any]:
+    # Normalize weeks + intervals
+    for r in edi_rows:
+        r["ForecastDate"] = norm_week_str(r.get("ForecastDate"))
+        r["DateFrom"]     = norm_week_str(r.get("DateFrom"))
+
+    all_ref_weeks = sorted({r["ForecastDate"] for r in edi_rows if r.get("ForecastDate")}, key=week_order_key)
+    if len(all_ref_weeks) < 2:
+        raise ValueError(f"Cumulative analysis requires at least 2 forecast weeks, found {len(all_ref_weeks)}.")
+
+    rows_by_refweek: Dict[str, List[dict]] = defaultdict(list)
+    for r in edi_rows:
+        ref_w = r["ForecastDate"]
+        row_w = r["DateFrom"]
+        diff = week_diff(row_w, ref_w)
+        r["Interval"] = get_interval(diff)
+        rows_by_refweek[ref_w].append(r)
+
+    # In-Transit: (Site, Week) -> { Product -> qty }
+    in_transit_map: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for d in delivery_rows:
+        if str(d.get("Status", "")).strip().lower() != "in transit":
+            continue
+        site = str(d.get("Site", "")).strip()
+        prod = d.get("AVOMaterialNo") or d.get("ClientMaterialNo")
+        date_w = norm_week_str(d.get("Date"))
+        if not site or not prod or not date_w:
+            continue
+        try:
+            qty = float(d.get("Quantity", 0) or 0)
+        except (ValueError, TypeError):
+            qty = 0.0
+        in_transit_map[(site, date_w)][str(prod)] += qty
+
+    detailed_report: List[dict] = []
+    # key = (Site, ClientCode, AVOMaterialNo, Interval)
+    all_quantities_by_key: Dict[Tuple[str, str, str, str], Dict[str, float]] = defaultdict(dict)
+
+    for i in range(len(all_ref_weeks) - 1):
+        w1_ref, w2_ref = all_ref_weeks[i], all_ref_weeks[i + 1]
+        w1_data = rows_by_refweek.get(w1_ref, [])
+        w2_data = rows_by_refweek.get(w2_ref, [])
+
+        group_keys = ["Site", "ClientCode", "AVOMaterialNo", "Interval"]
+        grouped_w1 = group_and_sum(w1_data, group_keys, "Quantity")
+        grouped_w2 = group_and_sum(w2_data, group_keys, "Quantity")
+
+        w1_map = {(r["Site"], r["ClientCode"], r["AVOMaterialNo"], r["Interval"]): r.get("Quantity", 0.0) for r in grouped_w1}
+        w2_map = {(r["Site"], r["ClientCode"], r["AVOMaterialNo"], r["Interval"]): r.get("Quantity", 0.0) for r in grouped_w2}
+
+        all_keys = set(w1_map.keys()) | set(w2_map.keys())
+
+        for key in all_keys:
+            site, client, product, interval = key
+            q1 = float(w1_map.get(key, 0.0))
+            q2 = float(w2_map.get(key, 0.0))
+
+            all_quantities_by_key[key][w1_ref] = q1
+            all_quantities_by_key[key][w2_ref] = q2
+
+            difference = q2 - q1
+            variation_pct = round(100 * (difference / q1), 2) if q1 > 0 else 0.0
+            allowed_change = get_allowed_change(interval)
+            violation = abs(variation_pct) > allowed_change
+
+            row = {
+                "Week_Comparison": f"{w1_ref}_vs_{w2_ref}",
+                "Site": site,
+                "ClientCode": client,
+                "AVOMaterialNo": product,
+                "Interval": interval,
+                "Quantity_W1": q1,
+                "Quantity_W2": q2,
+                "Difference": difference,
+                "Variation_Pct": f"{variation_pct}%",
+                "Allowed_Change_%": allowed_change,
+                "Violation": violation,
+                "InTransit": "",
+                "Required_W": "",
+                "Coverage_OK": "",
+                "Delivery_Issue": "",
+            }
+
+            if interval == "W-1 to W":
+                required_w = q2
+                in_transit = in_transit_map.get((site, w2_ref), {}).get(str(product), 0.0)
+                coverage_ok = in_transit >= required_w
+                row.update({
+                    "InTransit": in_transit,
+                    "Required_W": required_w,
+                    "Coverage_OK": coverage_ok,
+                    "Delivery_Issue": not coverage_ok,
+                })
+
+            detailed_report.append(row)
+
+    # Summary
+    summary_per_group = []
+    start_ref, end_ref = all_ref_weeks[0], all_ref_weeks[-1]
+    for key, weekly_quantities in all_quantities_by_key.items():
+        site, client, product, interval = key
+        group_rows = [
+            r for r in detailed_report
+            if r["Site"] == site and r["ClientCode"] == client and r["AVOMaterialNo"] == product and r["Interval"] == interval
+        ]
+        total_diff = sum(r["Difference"] for r in group_rows)
+        start_q = float(weekly_quantities.get(start_ref, 0.0))
+        end_q   = float(weekly_quantities.get(end_ref, 0.0))
+        total_pct_var = round(100 * (end_q - start_q) / start_q, 2) if start_q > 0 else 0.0
+        summary_per_group.append({
+            "Site": site,
+            "ClientCode": client,
+            "AVOMaterialNo": product,
+            "Interval": interval,
+            "Total_Cumulated_Quantity_Difference": total_diff,
+            "Total_Cumulated_Percentage_Variation": f"{total_pct_var}%"
+        })
+
+    # Sheets
+    green_sheet, red_sheet = [], []
+    for r in detailed_report:
+        is_green = (r["Interval"] == "W-1 to W" and r.get("Coverage_OK") is True) or (r.get("Violation") is False)
+        if is_green:
+            green_sheet.append(r)
+        else:
+            if r["Interval"] == "W-1 to W" and r.get("Delivery_Issue") is True:
+                red_sheet.append(r)
+            elif r.get("Violation") is True:
+                red_sheet.append(r)
+
+    return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet}
+
+# ========================= ROUTE =========================
+@app.route("/edi-analysis", methods=["POST"])
+def edi_analysis_run():
+    body = request.get_json(silent=True) or {}
+    try:
+        # Validate payload
+        weeks = body.get("forecastWeeks")
+        if not isinstance(weeks, list) or len(weeks) < 2:
+            return jsonify({"status": "error", "message": "forecastWeeks must be an array with at least 2 items."}), 400
+        if any(not isinstance(w, str) or not WEEK_RE.match(w) for w in weeks):
+            return jsonify({"status": "error", "message": "All forecastWeeks must match 'YYYY-WXX' (zero-padded)."}), 400
+
+        client_codes = body.get("clientCodes") or None
+        product_codes = body.get("productCodes") or None  # AVOMaterialNo
+        sites = body.get("sites") or None
+
+        # Fetch rows
+        edi_rows = fetch_ediglobal(weeks, client_codes, product_codes, sites)
+        if not edi_rows:
+            return jsonify({"status": "ok", "data": {"summary_per_group": [], "green_sheet": [], "red_sheet": []}}), 200
+
+        delivery_rows = fetch_deliverydetails(weeks, product_codes, sites)
+
+        # Analyze
+        result = run_edi_analysis(edi_rows, delivery_rows)
+        return jsonify({"status": "ok", "data": result}), 200
+
+    except Exception as e:
+        # Optional: add logging.exception(e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5001,debug=True)
