@@ -2596,8 +2596,8 @@ def product_capacity_stock():
       // or
       "avo_material_nos": ["VA13116595N","V1001MR035"]
     }
-    Returns WeeklyCapacity from ProductDetails and summed Quantity from ProductStock,
-    fetched independently (no JOIN).
+    Returns WeeklyCapacity + Line from ProductDetails, and summed Quantity from ProductStock.
+    (Fetched independently — no JOIN.)
     """
     try:
         body = _extract_body()
@@ -2610,11 +2610,12 @@ def product_capacity_stock():
             app.logger.warning("Missing AVOMaterialNo.")
             return jsonify({"ok": False, "error": "AVOMaterialNo is required."}), 400
 
-        # --- Query ProductDetails (WeeklyCapacity) — NO JOIN ---
+        # --- Query ProductDetails (WeeklyCapacity + Line) — NO JOIN ---
         sql_pd = '''
             SELECT
                 "AVOMaterialNo",
-                MAX("WeeklyCapacity") AS "WeeklyCapacity"
+                MAX("WeeklyCapacity") AS "WeeklyCapacity",
+                MAX("Line") AS "Line"
             FROM public."ProductDetails"
             WHERE "AVOMaterialNo" = ANY(%s)
             GROUP BY "AVOMaterialNo";
@@ -2640,7 +2641,14 @@ def product_capacity_stock():
                 cur.execute(sql_pd, [avo_list])
                 pd_rows = cur.fetchall()
                 app.logger.info("ProductDetails rows: %d", len(pd_rows))
-                pd_map = {r["AVOMaterialNo"]: r["WeeklyCapacity"] for r in pd_rows}
+                # map: AVO -> {"WeeklyCapacity": x, "Line": y}
+                pd_map = {
+                    r["AVOMaterialNo"]: {
+                        "WeeklyCapacity": r["WeeklyCapacity"],
+                        "Line": r.get("Line")
+                    }
+                    for r in pd_rows
+                }
 
                 # ProductStock
                 cur.execute(sql_ps, [avo_list])
@@ -2653,10 +2661,14 @@ def product_capacity_stock():
         # Merge results in Python (preserve request order)
         items = []
         for avo in avo_list:
-            weekly = pd_map.get(avo)
+            pd_info = pd_map.get(avo, {})
+            weekly = pd_info.get("WeeklyCapacity")
+            line   = pd_info.get("Line")
             totalq = ps_map.get(avo, 0)
+
             items.append({
                 "AVOMaterialNo": avo,
+                "Line": line,  # <= added
                 "WeeklyCapacity": int(weekly) if weekly is not None else None,
                 "TotalQuantity": int(totalq or 0),
             })
