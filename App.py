@@ -2,6 +2,7 @@ import base64
 import csv
 import io
 import logging
+import traceback
 import fitz  # PyMuPDF
 from flask import Flask, request, jsonify
 import psycopg2
@@ -10,11 +11,16 @@ import PyPDF2
 from psycopg2 import errors
 from datetime import datetime ,date
 import re
-from collections import defaultdict
+from collections import defaultdict , Counter
 import os
 from psycopg2.extras import execute_values
 from PyPDF2 import PdfReader
+from PIL import Image
+import json, gzip
+from typing import Any, Dict, List, Optional, Tuple
 
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
 # Use your actual DATABASE_URL as an environment variable for better security!
@@ -299,6 +305,8 @@ def process_nidec_rows(rows, header):
 
     def make_avo_material_code(code):
         code = code.strip()
+        if code == "502-730-99-99":
+            return "VA13116595N"
         # If contains any letter, just add V in front
         if re.search(r'[a-zA-Z]', code):
             return "V" + code
@@ -1589,7 +1597,6 @@ def process_valeo_de_csv_rows(rows, header):
     return processed
 
 
-
 def process_nidec_de_csv_rows(rows, header):
     plant_to_client = {
         "ZI01": "100420",  # Nidec Poland - Germany site
@@ -1807,6 +1814,113 @@ def parse_pdf(file_bytes_io):
     return text
 
 
+def process_nidec_de_pdf(file_bytes):
+    import re, io
+    from datetime import datetime
+
+    text = parse_pdf(io.BytesIO(file_bytes))
+
+    # --- helpers ---
+    def int_from(s):
+        return int(re.sub(r"[^\d]", "", s)) if s else 0
+
+    def safe_to_forecast_week(date_str):
+        if not date_str:
+            return ""
+        for fmt in ("%m/%d/%Y", "%d.%m.%Y", "%m.%d.%Y"):
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                break
+            except ValueError:
+                dt = None
+        if not dt:
+            return ""
+        week = dt.isocalendar()[1]
+        
+        return f"{dt.year}-W{week:02d}"
+
+    records = []
+
+    # Normalize whitespace
+    norm = re.sub(r"[ \t]+", " ", text)
+
+    # --- Extract ForecastDate ONCE from document-level Release Date ---
+    release_m = re.search(r"Release date\s*(\d{2}/\d{2}/\d{4})", norm, re.IGNORECASE)
+    release_date = release_m.group(1) if release_m else ""
+    forecast_week = safe_to_forecast_week(release_date)
+
+    # --- Split into product blocks ---
+    starts = [m.start() for m in re.finditer(r"NIDEC PART NUMBER:\s*\S+", norm)]
+    if not starts:
+        return records
+
+    blocks = [norm[starts[i]: starts[i+1]] for i in range(len(starts)-1)]
+    blocks.append(norm[starts[-1]:])
+
+    for block in blocks:
+        # Header fields
+        part_m = re.search(r"NIDEC PART NUMBER:\s*([A-Za-z0-9\-]+)", block)
+        desc_m = re.search(r"DESCRIPTION:\s*([^\n\r]+)", block)
+
+        part = part_m.group(1) if part_m else "UNKNOWN"
+        desc = (desc_m.group(1).strip() if desc_m else None)
+
+        # Status = Forecast if FORECAST SCHEDULE is found
+        is_forecast = "FORECAST SCHEDULE" in block.upper()
+        edi_status = "Forecast" if is_forecast else "Firm"
+
+        # Last delivery
+        last_m = re.search(
+            r"Last goods receipt\s*([\d\.,]+)\s*items.*?on\s*(\d{2}/\d{2}/\d{4}).*?delivery note no\.\s*([0-9A-Za-z]+)",
+            block, flags=re.IGNORECASE | re.DOTALL
+        )
+        last_qty = int_from(last_m.group(1)) if last_m else 0
+        last_date = last_m.group(2) if last_m else ""
+        last_note = last_m.group(3) if last_m else ""
+
+        # Shipment schedule section
+        sched_m = re.search(
+            r"(DATE\s+QUANTITY\s+CUMM\s+QTY\.[\s\S]*?)(?:CUMMS AUTHORIZATION|FORECAST SCHEDULE|LAST DELIVERIES|PAGE:|SCHEDULE AGREEMENT|TRANSIT INFORMATION)",
+            block, flags=re.IGNORECASE
+        )
+        sched_text = sched_m.group(1) if sched_m else ""
+
+        # Parse rows
+        for line in sched_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r"^(\d{2}/\d{2}/\d{4})\s+([\d,]+)\s+([\d,]+)$", line)
+            if not m:
+                continue
+            ship_date, qty_s, cum_s = m.groups()
+            qty = int_from(qty_s)
+            cum = int_from(cum_s)
+
+            records.append({
+                "Site": "Germany",
+                "ClientCode": "302194",                    # Nidec Germany (ZI01)
+                "ClientMaterialNo": part,
+                "AVOMaterialNo": part,
+                "DateFrom": safe_to_forecast_week(ship_date),
+                "DateUntil": ship_date,
+                "Quantity": qty,
+                "ForecastDate": forecast_week,             # Global value reused
+                "LastDeliveryDate": safe_to_forecast_week(last_date) if last_date else "",
+                "LastDeliveredQuantity": last_qty,
+                "CumulatedQuantity": cum,
+                "EDIStatus": edi_status,
+                "ProductName": desc,
+                "LastDeliveryNo": last_note
+            })
+
+    return records
+
+
+
+
+
+
 @app.route("/process-GermanySite", methods=['POST'])
 def process_file_endpoint_germany():
     data = request.get_json()
@@ -1888,6 +2002,15 @@ def process_file_endpoint_germany():
                     extracted_records = process_bosch_pdf(file_bytes, file_name)
                 else:
                     return jsonify({"error": "Could not extract Standortcode (Kunde) from Bosch PDF."}), 400
+            elif "NIDEC PART NUMBER" in text and "AVO CARBON GERMANY GMBH" in text:
+                company = "Nidec USA"
+                extracted_records = process_nidec_de_pdf(file_bytes)
+            elif "DENSO MANUFACTURING ITALIA" in text and "MATERIAL RELEASE" in text:
+                if "AVO CARBON GERMANY GMBH" in text:
+                    company = "Denso"
+                    extracted_records = process_denso_de_pdf(file_bytes)
+                else:
+                    return jsonify({"error": "Unrecognized Denso recipient in PDF."}), 400
             else:
                 return jsonify({"error": "Unrecognized PDF format – Bosch header not found."}), 400
 
@@ -1912,11 +2035,17 @@ def process_file_endpoint_germany():
 
 
 
-# ========================= EDI ANALYSIS HELPERS =========================
-import re
-from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
+# ========================= EDI ANALYSIS (FULL) =========================
 
+
+def _log(msg, *args):
+    try:
+        logger = app.logger  # Flask app logger if available in your project
+    except Exception:
+        logger = logging.getLogger("edi")
+    logger.info(msg, *args)
+
+# ========================= HELPERS =========================
 WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")  # e.g., 2025-W07
 
 def norm_week_str(s: Optional[str]) -> Optional[str]:
@@ -1950,13 +2079,13 @@ def week_diff(a: str, b: str) -> Optional[int]:
     return (ya - yb) * 52 + (wa - wb)
 
 def get_interval(week_diff_val: Optional[int]) -> str:
-    if week_diff_val is None: return "Invalid Date Format"
-    if week_diff_val <= 0:   return "W-1 to W"
-    if week_diff_val == 1:   return "W+1"
+    if week_diff_val is None: return "BackLog"
+    if week_diff_val <= 1:    return "W-1 to W"      # current/backlog only
+    # if week_diff_val == 1:  return "W+1"
     if 2 <= week_diff_val <= 5:   return "W+2 to W+5"
     if 6 <= week_diff_val <= 14:  return "W+6 to W+14"
     if 15 <= week_diff_val <= 24: return "W+15 to W+24"
-    if week_diff_val >= 25:  return "W+25 and more"
+    if week_diff_val >= 25:       return "W+25 and more"
     return "Other"
 
 def get_allowed_change(interval: str) -> int:
@@ -1979,6 +2108,79 @@ def group_and_sum(rows: List[dict], group_keys: List[str], sum_key: str) -> List
         base[sum_key] = total
         out.append(base)
     return out
+
+# ---------- Debug helpers ----------
+def debug_dump_deliveries(tag: str, rows: List[dict], limit: int = 8):
+    _log("[DELIV:%s] fetched rows: %d", tag, len(rows))
+    statuses = Counter([str(r.get("Status","")).strip().lower() for r in rows])
+    _log("[DELIV:%s] statuses: %s", tag, dict(statuses))
+    sites = Counter([str(r.get("Site","")).strip() for r in rows])
+    _log("[DELIV:%s] top sites: %s", tag, sites.most_common(5))
+    prods = Counter([str(r.get("AVOMaterialNo") or r.get("ClientMaterialNo") or "") for r in rows])
+    _log("[DELIV:%s] top products: %s", tag, prods.most_common(5))
+    for r in rows[:limit]:
+        _log("[DELIV:%s][SAMPLE] %s", tag, r)
+
+def debug_dump_intransit_map_site_only(map_s: Dict[str, Dict[str, float]], limit_sites=5, limit_prods=8):
+    _log("[ITR] site/product entries: %d", len(map_s))
+    shown = 0
+    for site, m in list(map_s.items())[:limit_sites]:
+        items = sorted(m.items(), key=lambda kv: kv[1], reverse=True)[:limit_prods]
+        _log("[ITR] site=%s top products: %s", site, items)
+        shown += 1
+        if shown >= limit_sites: break
+
+def debug_log_coverage_row(phase: str, site: str, product: str, interval: str,
+                           ref_week: str, required_w: float, in_transit: float, ok: bool):
+    _log("[COV:%s] site=%s prod=%s interval=%s ref=%s required=%.2f in_transit=%.2f ok=%s",
+         phase, site, product, interval, ref_week, required_w, in_transit, ok)
+
+def debug_probe_deliverytable(product_codes: Optional[List[str]], sites: Optional[List[str]]):
+    """Lightweight probes to show what's actually inside DeliveryDetails."""
+    try:
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            cur.execute('SELECT UPPER(TRIM("Status")) AS s, COUNT(*) FROM "DeliveryDetails" GROUP BY 1 ORDER BY 2 DESC')
+            rows = cur.fetchall()
+            _log("[DELIV:PROBE] status counts: %s", rows)
+
+            cur.execute('SELECT TRIM("Site") AS site, COUNT(*) FROM "DeliveryDetails" GROUP BY 1 ORDER BY 2 DESC LIMIT 20')
+            rows = cur.fetchall()
+            _log("[DELIV:PROBE] top sites: %s", rows)
+
+            cur.execute('''
+                SELECT
+                  SUM(CASE WHEN "AVOMaterialNo" IS NOT NULL AND "AVOMaterialNo" <> '' THEN 1 ELSE 0 END) AS avo_filled,
+                  SUM(CASE WHEN ("AVOMaterialNo" IS NULL OR "AVOMaterialNo" = '') AND ("ClientMaterialNo" IS NOT NULL AND "ClientMaterialNo" <> '') THEN 1 ELSE 0 END) AS client_only
+                FROM "DeliveryDetails"
+            ''')
+            rows = cur.fetchall()
+            _log("[DELIV:PROBE] AVO filled vs client-only: %s", rows)
+
+            if product_codes:
+                cur.execute('''
+                    SELECT COUNT(*)
+                    FROM "DeliveryDetails"
+                    WHERE UPPER(COALESCE("AVOMaterialNo", '')) = ANY(%s)
+                       OR UPPER(COALESCE("ClientMaterialNo", '')) = ANY(%s)
+                ''', ([p.upper() for p in product_codes], [p.upper() for p in product_codes]))
+                cnt = cur.fetchone()[0]
+                _log("[DELIV:PROBE] rows matching product_codes by AVO or ClientMaterialNo: %s", cnt)
+            if sites:
+                cur.execute('''
+                    SELECT COUNT(*)
+                    FROM "DeliveryDetails"
+                    WHERE UPPER(TRIM("Site")) = ANY(%s)
+                ''', ([s.upper().strip() for s in sites],))
+                cnt = cur.fetchone()[0]
+                _log("[DELIV:PROBE] rows matching sites: %s", cnt)
+    except Exception as e:
+        _log("[DELIV:PROBE][ERROR] %s", e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # ========================= DB FETCHERS =========================
 def fetch_ediglobal(
@@ -2010,38 +2212,62 @@ def fetch_ediglobal(
     finally:
         conn.close()
 
-def fetch_deliverydetails(
-    weeks: List[str],
+def fetch_deliverydetails_raw(
     product_codes: Optional[List[str]],
     sites: Optional[List[str]],
 ) -> List[dict]:
+    """
+    Fetch delivery rows broadly and normalize:
+    - Accept common status variants (IN TRANSIT, INTRANSIT, DISPATCHED, DELIVERED)
+    - Match products by AVO or ClientMaterialNo (case-insensitive)
+    - Match Site case-insensitively, trimmed
+    """
+    prods_upper = [p.upper().strip() for p in product_codes] if product_codes else None
+    sites_upper = [s.upper().strip() for s in sites] if sites else None
+
     fields = '"Site","AVOMaterialNo","ClientMaterialNo","Date","Status","Quantity"'
     sql = f'''
         SELECT {fields}
         FROM "DeliveryDetails"
-        WHERE "Status" = 'In Transit'
-          AND "Date" = ANY(%s)
+        WHERE UPPER(TRIM("Status")) IN ('IN TRANSIT','INTRANSIT','DISPATCHED','DELIVERED')
     '''
-    params: List[Any] = [weeks]
-    if product_codes:
-        sql += ' AND "AVOMaterialNo" = ANY(%s)'
-        params.append(product_codes)
-    if sites:
-        sql += ' AND "Site" = ANY(%s)'
-        params.append(sites)
+    params: List[Any] = []
+
+    if prods_upper:
+        sql += '''
+          AND (
+            UPPER(COALESCE("AVOMaterialNo", '')) = ANY(%s)
+            OR UPPER(COALESCE("ClientMaterialNo", '')) = ANY(%s)
+          )
+        '''
+        params.extend([prods_upper, prods_upper])
+
+    if sites_upper:
+        sql += ' AND UPPER(TRIM("Site")) = ANY(%s)'
+        params.append(sites_upper)
 
     conn = get_pg_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             cols = [c.name for c in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            debug_dump_deliveries("RAW", rows)
+            return rows
     finally:
         conn.close()
 
+def fetch_deliverydetails(
+    weeks: List[str],                 # kept for signature compatibility
+    product_codes: Optional[List[str]],
+    sites: Optional[List[str]],
+) -> List[dict]:
+    # Return ALL relevant delivery rows (no week filter)
+    return fetch_deliverydetails_raw(product_codes, sites)
+
 # ========================= CORE ANALYSIS =========================
 def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[str, Any]:
-    # Normalize weeks + intervals
+    # Normalize weeks + intervals on EDI
     for r in edi_rows:
         r["ForecastDate"] = norm_week_str(r.get("ForecastDate"))
         r["DateFrom"]     = norm_week_str(r.get("DateFrom"))
@@ -2058,24 +2284,30 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
         r["Interval"] = get_interval(diff)
         rows_by_refweek[ref_w].append(r)
 
-    # In-Transit: (Site, Week) -> { Product -> qty }
-    in_transit_map: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    # ---- Effective In-Transit: (Site) -> { Product -> qty } ----
+    in_transit_map: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for d in delivery_rows:
-        if str(d.get("Status", "")).strip().lower() != "in transit":
-            continue
-        site = str(d.get("Site", "")).strip()
-        prod = d.get("AVOMaterialNo") or d.get("ClientMaterialNo")
-        date_w = norm_week_str(d.get("Date"))
-        if not site or not prod or not date_w:
+        site = (d.get("Site") or "").strip()
+        prod = (d.get("AVOMaterialNo") or d.get("ClientMaterialNo") or "").strip()
+        if not site or not prod:
             continue
         try:
             qty = float(d.get("Quantity", 0) or 0)
         except (ValueError, TypeError):
             qty = 0.0
-        in_transit_map[(site, date_w)][str(prod)] += qty
+        status_norm = str(d.get("Status","")).strip().upper().replace(" ", "")
+        if status_norm in {"INTRANSIT", "DISPATCHED"}:
+            in_transit_map[site][prod] += qty
+        elif status_norm == "DELIVERED":
+            in_transit_map[site][prod] -= qty
+    # clamp negatives
+    for site, m in in_transit_map.items():
+        for p in list(m.keys()):
+            if m[p] < 0:
+                m[p] = 0.0
+    debug_dump_intransit_map_site_only(in_transit_map)
 
     detailed_report: List[dict] = []
-    # key = (Site, ClientCode, AVOMaterialNo, Interval)
     all_quantities_by_key: Dict[Tuple[str, str, str, str], Dict[str, float]] = defaultdict(dict)
 
     for i in range(len(all_ref_weeks) - 1):
@@ -2125,7 +2357,7 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
 
             if interval == "W-1 to W":
                 required_w = q2
-                in_transit = in_transit_map.get((site, w2_ref), {}).get(str(product), 0.0)
+                in_transit = in_transit_map.get(site, {}).get(str(product), 0.0)
                 coverage_ok = in_transit >= required_w
                 row.update({
                     "InTransit": in_transit,
@@ -2133,6 +2365,7 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
                     "Coverage_OK": coverage_ok,
                     "Delivery_Issue": not coverage_ok,
                 })
+                debug_log_coverage_row("MULTI", site, str(product), interval, w2_ref, required_w, in_transit, coverage_ok)
 
             detailed_report.append(row)
 
@@ -2172,48 +2405,267 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
 
     return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet}
 
+# ---------- single-week analysis (coverage-only) ----------
+def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[str, Any]:
+    for r in edi_rows:
+        r["ForecastDate"] = norm_week_str(r.get("ForecastDate"))
+        r["DateFrom"]     = norm_week_str(r.get("DateFrom"))
+    ref_weeks = sorted({r["ForecastDate"] for r in edi_rows if r.get("ForecastDate")}, key=week_order_key)
+    if not ref_weeks:
+        return {"summary_per_group": [], "green_sheet": [], "red_sheet": [], "analysis_mode": "single_week"}
+
+    w_ref = ref_weeks[0]
+    for r in edi_rows:
+        r["Interval"] = get_interval(week_diff(r["DateFrom"], r["ForecastDate"]))
+
+    # ---- Effective In-Transit: (Site) -> { Product -> qty } ----
+    in_transit_map: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for d in delivery_rows:
+        site = (d.get("Site") or "").strip()
+        prod = (d.get("AVOMaterialNo") or d.get("ClientMaterialNo") or "").strip()
+        if not site or not prod:
+            continue
+        try:
+            qty = float(d.get("Quantity", 0) or 0)
+        except (ValueError, TypeError):
+            qty = 0.0
+        status_norm = str(d.get("Status","")).strip().upper().replace(" ", "")
+        if status_norm in {"INTRANSIT", "DISPATCHED"}:
+            in_transit_map[site][prod] += qty
+        elif status_norm == "DELIVERED":
+            in_transit_map[site][prod] -= qty
+    for site, m in in_transit_map.items():
+        for p in list(m.keys()):
+            if m[p] < 0:
+                m[p] = 0.0
+    debug_dump_intransit_map_site_only(in_transit_map)
+
+    group_keys = ["Site","ClientCode","AVOMaterialNo","Interval"]
+    grouped = group_and_sum([r for r in edi_rows if r["ForecastDate"] == w_ref], group_keys, "Quantity")
+
+    detailed_report = []
+    for g in grouped:
+        site, client, product, interval = g["Site"], g["ClientCode"], g["AVOMaterialNo"], g["Interval"]
+        q = float(g["Quantity"] or 0)
+        row = {
+            "Week_Comparison": f"{w_ref}_single",
+            "Site": site, "ClientCode": client, "AVOMaterialNo": product, "Interval": interval,
+            "Quantity_W1": q, "Quantity_W2": q, "Difference": 0.0, "Variation_Pct": "0.0%",
+            "Allowed_Change_%": get_allowed_change(interval), "Violation": False,
+            "InTransit": "", "Required_W": "", "Coverage_OK": "", "Delivery_Issue": ""
+        }
+        if interval == "W-1 to W":
+            required_w = q
+            in_transit = in_transit_map.get(site, {}).get(str(product), 0.0)
+            coverage_ok = in_transit >= required_w
+            row.update({"InTransit": in_transit, "Required_W": required_w, "Coverage_OK": coverage_ok, "Delivery_Issue": not coverage_ok})
+            debug_log_coverage_row("SINGLE", site, str(product), interval, w_ref, required_w, in_transit, coverage_ok)
+
+        detailed_report.append(row)
+
+    # summary: zeros (single-week)
+    summary_per_group = []
+    for g in grouped:
+        summary_per_group.append({
+            "Site": g["Site"], "ClientCode": g["ClientCode"], "AVOMaterialNo": g["AVOMaterialNo"], "Interval": g["Interval"],
+            "Total_Cumulated_Quantity_Difference": 0.0, "Total_Cumulated_Percentage_Variation": "0.0%"
+        })
+
+    # sheets
+    green_sheet, red_sheet = [], []
+    for r in detailed_report:
+        is_green = (r["Interval"] == "W-1 to W" and r.get("Coverage_OK") is True) or (r.get("Violation") is False)
+        if is_green:
+            green_sheet.append(r)
+        else:
+            if r["Interval"] == "W-1 to W" and r.get("Delivery_Issue") is True:
+                red_sheet.append(r)
+            elif r.get("Violation") is True:
+                red_sheet.append(r)
+
+    return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet, "analysis_mode": "single_week"}
+
 # ========================= ROUTE =========================
 @app.route("/edi-analysis", methods=["POST"])
 def edi_analysis_run():
-    body = request.get_json(silent=True) or {}
     try:
-        # Validate payload
-        weeks = body.get("forecastWeeks")
-        if not isinstance(weeks, list) or len(weeks) < 2:
-            return jsonify({"status": "error", "message": "forecastWeeks must be an array with at least 2 items."}), 400
-        if any(not isinstance(w, str) or not WEEK_RE.match(w) for w in weeks):
-            return jsonify({"status": "error", "message": "All forecastWeeks must match 'YYYY-WXX' (zero-padded)."}), 400
+        body = _extract_body()
 
-        client_codes = body.get("clientCodes") or None
-        product_codes = body.get("productCodes") or None  # AVOMaterialNo
-        sites = body.get("sites") or None
+        # Accept legacy keys too
+        weeks = _coerce_list(body.get("forecastWeeks") or body.get("ediWeekNumbers"))
+        client_codes = _coerce_list(body.get("clientCodes") or body.get("ClientCode"))
+        product_codes = _coerce_list(body.get("productCodes") or body.get("ProductCode") or body.get("AVOMaterialNo"))
+        sites = _coerce_list(body.get("sites") or body.get("Site"))
 
-        # Fetch rows
+        if not weeks:
+            return jsonify({"status":"error","message":"forecastWeeks is required (array)."}), 400
+        # format check
+        bad = [w for w in weeks if not WEEK_RE.match(str(w))]
+        if bad:
+            return jsonify({"status":"error","message":f"Weeks must be 'YYYY-WXX'. Bad: {bad}"}), 400
+
+        _log("[ROUTE] weeks=%s client_codes=%s product_codes=%s sites=%s",
+             weeks, client_codes, product_codes, sites)
+
+        # Fetch DB rows
         edi_rows = fetch_ediglobal(weeks, client_codes, product_codes, sites)
-        if not edi_rows:
-            return jsonify({"status": "ok", "data": {"summary_per_group": [], "green_sheet": [], "red_sheet": []}}), 200
-
+        debug_probe_deliverytable(product_codes, sites)
         delivery_rows = fetch_deliverydetails(weeks, product_codes, sites)
 
-        # Analyze
-        result = run_edi_analysis(edi_rows, delivery_rows)
-        return jsonify({"status": "ok", "data": result}), 200
+        _log("[ROUTE] fetched edi_rows=%d delivery_rows=%d", len(edi_rows), len(delivery_rows))
+
+        # Single-week coverage mode OR multi-week full analysis
+        if len(weeks) == 1:
+            result = analyze_single_week(edi_rows, delivery_rows)
+        else:
+            result = run_edi_analysis(edi_rows, delivery_rows)
+
+        return jsonify({"status":"ok","data":result}), 200
 
     except Exception as e:
-        # Optional: add logging.exception(e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status":"error","message":str(e)}), 500
+
+# ---------- robust payload parsing ----------
+def _coerce_list(v):
+    """Accept list, single string, CSV string, numbers; return list[str] or None."""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, (int, float)):
+        return [str(v)]
+    if isinstance(v, str):
+        s = v.strip()
+        # try JSON array string
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                return [str(x).strip() for x in arr if str(x).strip()]
+            except Exception:
+                pass
+        # CSV fallback
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return None
+
+def _extract_body():
+    """Parse JSON (incl. gzipped), else form/multipart, else empty dict."""
+    raw = request.get_data(cache=False, as_text=False)
+    if raw:
+        enc = (request.headers.get("Content-Encoding") or "").lower()
+        if "gzip" in enc:
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            pass
+
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        return body
+
+    if request.form:
+        d = {k: request.form.getlist(k) for k in request.form.keys()}
+        return {k: (v if len(v) > 1 else v[0]) for k, v in d.items()}
+
+    if request.args:
+        d = {k: request.args.getlist(k) for k in request.args.keys()}
+        return {k: (v if len(v) > 1 else v[0]) for k, v in d.items()}
+
+    return {}
 
 
 
 
 
 
+# ======================================================== ROUTE ==========================================================================
 
 
+app.logger.setLevel(logging.INFO)
 
 
+@app.route("/product-capacity-stock", methods=["POST"])
+def product_capacity_stock():
+    """
+    Body (list or CSV string accepted):
+    {
+      "AVOMaterialNo": ["VA13116595N","V1001MR035"]
+      // or
+      "avo_material_nos": ["VA13116595N","V1001MR035"]
+    }
+    Returns WeeklyCapacity from ProductDetails and summed Quantity from ProductStock,
+    fetched independently (no JOIN).
+    """
+    try:
+        body = _extract_body()
+        app.logger.info("POST /product-capacity-stock payload: %s", body)
 
+        avo_list = _coerce_list(body.get("AVOMaterialNo") or body.get("avo_material_nos"))
+        app.logger.info("Parsed AVOMaterialNo: %s", avo_list)
 
+        if not avo_list:
+            app.logger.warning("Missing AVOMaterialNo.")
+            return jsonify({"ok": False, "error": "AVOMaterialNo is required."}), 400
+
+        # --- Query ProductDetails (WeeklyCapacity) — NO JOIN ---
+        sql_pd = '''
+            SELECT
+                "AVOMaterialNo",
+                MAX("WeeklyCapacity") AS "WeeklyCapacity"
+            FROM public."ProductDetails"
+            WHERE "AVOMaterialNo" = ANY(%s)
+            GROUP BY "AVOMaterialNo";
+        '''
+
+        # --- Query ProductStock (TotalQuantity) — NO JOIN ---
+        sql_ps = '''
+            SELECT
+                "ProductCode" AS "AVOMaterialNo",
+                COALESCE(SUM("Quantity"), 0) AS "TotalQuantity"
+            FROM public."ProductStock"
+            WHERE "ProductCode" = ANY(%s)
+            GROUP BY "ProductCode";
+        '''
+
+        app.logger.debug("SQL ProductDetails:\n%s", sql_pd)
+        app.logger.debug("SQL ProductStock:\n%s", sql_ps)
+
+        conn = get_pg_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # ProductDetails
+                cur.execute(sql_pd, [avo_list])
+                pd_rows = cur.fetchall()
+                app.logger.info("ProductDetails rows: %d", len(pd_rows))
+                pd_map = {r["AVOMaterialNo"]: r["WeeklyCapacity"] for r in pd_rows}
+
+                # ProductStock
+                cur.execute(sql_ps, [avo_list])
+                ps_rows = cur.fetchall()
+                app.logger.info("ProductStock rows: %d", len(ps_rows))
+                ps_map = {r["AVOMaterialNo"]: r["TotalQuantity"] for r in ps_rows}
+        finally:
+            conn.close()
+
+        # Merge results in Python (preserve request order)
+        items = []
+        for avo in avo_list:
+            weekly = pd_map.get(avo)
+            totalq = ps_map.get(avo, 0)
+            items.append({
+                "AVOMaterialNo": avo,
+                "WeeklyCapacity": int(weekly) if weekly is not None else None,
+                "TotalQuantity": int(totalq or 0),
+            })
+
+        return jsonify({"ok": True, "count": len(items), "items": items}), 200
+
+    except Exception as e:
+        app.logger.error("Error in /product-capacity-stock: %s\n%s", str(e), traceback.format_exc())
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 
@@ -2224,3 +2676,5 @@ def edi_analysis_run():
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5001,debug=True)
+
+		
