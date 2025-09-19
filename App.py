@@ -18,6 +18,8 @@ from PyPDF2 import PdfReader
 from PIL import Image
 import json, gzip
 from typing import Any, Dict, List, Optional, Tuple
+import pandas as pd
+import sqlalchemy as sa
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -291,10 +293,28 @@ def process_inteva_rows(rows, header):
 
 
 
-
-
-
 def process_nidec_rows(rows, header):
+    # New mapping: Old Part N° (current AVOMaterialNo) -> New Part N°
+    # (includes fix: 'V504.510' maps to 'V504.510 PL' with the missing 'V' restored)
+    NEW_AVO_MAPPING = {
+        # Nidec ESP
+        "VA18116507G": "V504.519SP",
+        "VA14116701A": "V504.243SP",
+        "VA14116698P": "V504.510SP",
+        "VA13116595N": "V502.730SP",
+        # Nidec POL
+        "V504.519": "V504.519PL",
+        "V504.243": "V504.243PL",
+        "V504.510": "V504.510PL",  # corrected (was "504.510 PL")
+    }
+
+    def apply_new_mapping(avo_code: str) -> str:
+        """Return mapped AVOMaterialNo if in mapping; otherwise original."""
+        mapped = NEW_AVO_MAPPING.get(avo_code.strip(), avo_code)
+        if mapped != avo_code:
+            logging.warning(f"DEBUG: AVOMaterialNo mapped '{avo_code}' -> '{mapped}'")
+        return mapped
+
     plant_to_client = {
         "ZI01": "C00126",
         "SPER": "C00050",
@@ -316,33 +336,40 @@ def process_nidec_rows(rows, header):
             return f"V{parts[0]}.{parts[1]}"
         # Fallback: just add V
         return "V" + code
+
     # Check all required fields exist
     required_fields = ['Plant', 'CallOffDate', 'Material', 'DateFrom', 'DateUntil', 'DespatchQty', 'LastDeliveryDate', 'LastDeliveryQuantity', 'CumQuantity', 'Status', 'LastDeliveryNo']
     for f in required_fields:
         if f not in idx:
             logging.error(f"Column missing in Nidec CSV: {f}")
             return []  # Exit early, can't process
+
     for i, row in enumerate(rows[1:], 1):
         if len(row) != len(header):
             logging.warning(f"Row length mismatch at row {i}: {len(row)} fields vs header {len(header)}. Row: {row}")
             continue
+
     for i, row in enumerate(rows[1:]):
         try:
             if len(row) < len(header):
                 row += [""] * (len(header) - len(row))
+
             plant = row[idx['Plant']].strip()
             if plant not in plant_to_client:
                 logging.warning(f"SKIP row {i+1}: Plant '{plant}' not recognized in plant_to_client")
                 continue
+
             client_code = plant_to_client.get(plant, None)
             if not client_code:
                 logging.warning(f"SKIP row {i+1}: No client_code for plant '{plant}'")
                 continue
+
             call_off_date_str = row[idx['CallOffDate']].strip()
             logging.warning(f"DEBUG: Row {i+1}: CallOffDate = '{call_off_date_str}'")
             if not call_off_date_str:
                 logging.warning(f"SKIP row {i+1}: Empty CallOffDate")
                 continue
+
             try:
                 date_obj = datetime.strptime(call_off_date_str, "%Y-%m-%d")
             except ValueError:
@@ -351,18 +378,24 @@ def process_nidec_rows(rows, header):
                 except ValueError:
                     logging.warning(f"SKIP row {i+1}: Unparsable CallOffDate '{call_off_date_str}'")
                     continue
+
             # All OK - continue with record as before
             week_num = date_obj.isocalendar()[1]
             if date_obj.weekday() > 1:
                 week_num += 1
             forecast_date = f"{date_obj.year}-W{week_num:02d}"
+
             material_code = row[idx['Material']].strip()
             avo_material_code = make_avo_material_code(material_code)
+
+            # ✅ Apply the new mapping to the computed AVOMaterialNo
+            avo_material_code_mapped = apply_new_mapping(avo_material_code)
+
             processed.append({
                 "Site": "Tunisia",
                 "ClientCode": client_code,
-                "ClientMaterialNo": material_code,      # as is from the file
-                "AVOMaterialNo": avo_material_code,     # transformed as per rule
+                "ClientMaterialNo": material_code,                         # as is from the file
+                "AVOMaterialNo": avo_material_code_mapped,                 # transformed + mapped
                 "DateFrom": to_forecast_week(row[idx['DateFrom']].strip()),
                 "DateUntil": row[idx['DateUntil']].strip(),
                 "Quantity": parse_euro_number(row[idx['DespatchQty']].strip()),
@@ -377,6 +410,7 @@ def process_nidec_rows(rows, header):
         except Exception as e:
             logging.error(f"Nidec row processing error at row {i+1}: {e}")
             logging.error(f"Nidec row processing error: {e}")
+
     logging.warning(f"DEBUG: Nidec processed {len(processed)} records from {len(rows)-1} data rows")
     return processed
 
@@ -1153,6 +1187,373 @@ def process_valeo_nevers_pdf(pdf_bytes, file_name):
 
 
 
+SUFFIX_TOKENS = {"PL", "SP"}
+
+def _safestr(v):
+    import math
+    if v is None: return ""
+    if isinstance(v, float) and math.isnan(v): return ""
+    return str(v).strip()
+
+def _normalize_avo_ref(s: object, following_hint: object = None) -> str:
+    base = _safestr(s)
+    if not base: return ""
+    parts = base.split()
+    code = parts[0]
+    suffix = None
+    if len(parts) >= 2 and parts[1].upper() in SUFFIX_TOKENS:
+        suffix = parts[1].upper()
+    if not suffix and following_hint is not None:
+        nxt = _safestr(following_hint)
+        if nxt:
+            tok = nxt.split()[0].upper()
+            if tok in SUFFIX_TOKENS:
+                suffix = tok
+    return code + (suffix or "")
+
+def _looks_like_pdf(b: bytes) -> bool:
+    return b.lstrip()[:5] == b"%PDF-"
+
+def _contains_facture(pdf_bytes: bytes, pages_to_check: int = 2) -> bool:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i in range(min(pages_to_check, len(pdf.pages))):
+                txt = pdf.pages[i].extract_text() or ""
+                if re.search(r"\bfacture\b", txt, re.IGNORECASE):
+                    return True
+    except Exception:
+        pass
+    return False
+
+def parse_delivery_pdf_bytes(pdf_bytes: bytes, *, default_site: str = "Tunisia") -> pd.DataFrame:
+    import io, re, pdfplumber, pandas as pd
+    from dateutil.parser import parse as dtparse
+
+    delivery_no = None
+    doc_date_iso = None
+    detected_site = None
+    rows = []
+
+    # helper: add a record
+    def _add(ref_val: str, qty_val: int):
+        rows.append({
+            "Date": doc_date_iso,
+            "DeliveryNo": str(delivery_no) if delivery_no else "UNKNOWN",
+            "AVOMaterialNo": ref_val,
+            "Quantity": int(qty_val),
+            "Site": detected_site or default_site,
+            "Status": "Dispatched",
+        })
+
+    # patterns
+    header_no_pat   = re.compile(r"FACTURE\s*n[°o]\s*([A-Za-z0-9\-_/]+)", re.IGNORECASE)
+    header_date_pat = re.compile(r"\bDate\s+(\d{1,2}/\d{1,2}/\d{4})\b", re.IGNORECASE)
+    site_pat        = re.compile(r"\bAVOCARBON[^\n]*", re.IGNORECASE)
+    total_row_pat   = re.compile(r"^\s*TOTAL\b", re.IGNORECASE)
+
+    # fallback line parser:
+    # ex line: "85030010 OUI V502.730 SP PPC 11TA ... 960 1,9672 0,3262 ..."
+    # capture ref (V502.730) and the quantity (960) that appears BEFORE 2–4 decimal numbers
+    line_pat = re.compile(
+    r"^\s*\d{8}\s+(?:OUI|NON)\s+([A-Z0-9][A-Z0-9.\-]+)(?:\s+(PL|SP))?\s+.+?\s+(\d{1,9})\s+(?:\d+[.,]\d+\s+){2,4}\S+",
+    re.IGNORECASE
+)
+
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # -------- header (page 1, with fallbacks) --------
+        if pdf.pages:
+            p0_text = pdf.pages[0].extract_text() or ""
+            m_no = header_no_pat.search(p0_text)
+            if m_no:
+                delivery_no = m_no.group(1).strip()
+            m_date = header_date_pat.search(p0_text) or re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", p0_text)
+            if m_date:
+                doc_date_iso = dtparse(m_date.group(1), dayfirst=True).date().isoformat()
+            m_site = site_pat.search(p0_text)
+            if m_site:
+                detected_site = "Tunisia"
+        # if date still missing, try PDF metadata
+        if not doc_date_iso:
+            try:
+                meta = pdf.metadata or {}
+                meta_date = meta.get("CreationDate") or meta.get("ModDate")
+                if meta_date:
+                    doc_date_iso = dtparse(meta_date).date().isoformat()
+            except Exception:
+                pass
+
+        # -------- attempt 1: table extraction --------
+        tbl_settings = dict(
+            vertical_strategy="lines",
+            horizontal_strategy="lines",
+            intersect_tolerance=5,
+            snap_tolerance=3,
+            join_tolerance=3,
+            text_x_tolerance=2,
+            text_y_tolerance=3,
+            keep_blank_chars=False,
+            edge_min_length=3,
+        )
+        header_ref = re.compile(r"\bREFERENCE\b|\bREFERENCE\s+ARTICLE\b|\bREF\b", re.IGNORECASE)
+        header_qty = re.compile(r"\bQUANTITE\b|\bQTE\b|\bQTY\b", re.IGNORECASE)
+        material_pat = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-_/]*[A-Za-z0-9]$")
+
+        found = 0
+        for page in pdf.pages:
+            tables = []
+            try:
+                t = page.extract_table(tbl_settings)
+                if t: tables.append(t)
+            except Exception:
+                pass
+            try:
+                ts = page.extract_tables(tbl_settings) or []
+                tables.extend(ts)
+            except Exception:
+                pass
+
+            for tbl in tables:
+                if not tbl or len(tbl) < 2:
+                    continue
+                ref_idx = qty_idx = None
+                # find headers in first rows
+                for r in tbl[:3]:
+                    if not r: continue
+                    for i, c in enumerate(r):
+                        cell = (c or "").strip()
+                        if ref_idx is None and header_ref.search(cell or ""):
+                            ref_idx = i
+                        if qty_idx is None and header_qty.search(cell or ""):
+                            qty_idx = i
+                    if ref_idx is not None and qty_idx is not None:
+                        break
+                # fallback heuristic on row 0
+                if ref_idx is None or qty_idx is None:
+                    r0 = tbl[0]
+                    for i, c in enumerate(r0):
+                        low = (c or "").lower()
+                        if ref_idx is None and "ref" in low and "prix" not in low:
+                            ref_idx = i
+                        if qty_idx is None and any(k in low for k in ("quant", "qty", "qte")):
+                            qty_idx = i
+                if ref_idx is None or qty_idx is None:
+                    continue
+
+                data_rows = tbl[1:]
+                for r in data_rows:
+                    if not r: continue
+                    if total_row_pat.search(" ".join([(c or "").strip() for c in r if c])):
+                        continue
+                    raw_ref = (r[ref_idx] or "").strip() if ref_idx < len(r) else ""
+                    following = (r[ref_idx + 1] if (ref_idx + 1) < len(r) else "")
+                    ref_val = _normalize_avo_ref(raw_ref, following)
+                    qty_val = (r[qty_idx] or "").strip() if qty_idx < len(r) else ""
+                    if not ref_val or not qty_val: 
+                        continue
+                    if not material_pat.match(ref_val): 
+                        continue
+                    qtxt = qty_val.replace("\u00A0", "").replace(" ", "").replace(",", "")
+                    if not re.match(r"^-?\d+(?:\.\d+)?$", qtxt):
+                        continue
+                    _add(ref_val, int(float(qtxt)))
+                    found += 1
+
+        # -------- attempt 2: text-line regex fallback --------
+        if found == 0:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                for line in text.splitlines():
+                    if total_row_pat.search(line):
+                        continue
+                    m = line_pat.search(line)
+                    if not m:
+                        continue
+                    ref_core = m.group(1).strip()
+                    ref_sfx = (m.group(2) or "").strip().upper()
+                    ref_val = ref_core + (ref_sfx if ref_sfx in SUFFIX_TOKENS else "")
+                    qty_val = int(m.group(3))
+                    _add(ref_val, qty_val)
+
+
+    df = pd.DataFrame(rows, columns=["Date","DeliveryNo","AVOMaterialNo","Quantity","Site","Status"])
+    if not df.empty:
+        df = df.drop_duplicates().reset_index(drop=True)
+    return df
+
+def _clean_qty(v):
+    """
+    Convert various user-entered quantity formats to a safe int.
+    Handles: strings with spaces/commas, floats, NaN, None.
+    """
+    if v is None:
+        return 0
+    if isinstance(v, (int,)):
+        return int(v)
+    if isinstance(v, float):
+        # If it's NaN, treat as 0
+        return 0 if (v != v) else int(round(v))
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan" or s.lower() == "none":
+        return 0
+    # remove common thousand separators and non-digit except minus sign
+    s = s.replace(",", "").replace(" ", "").replace("\u00A0", "")  # remove normal & non-breaking spaces
+    m = re.match(r"^-?\d+(\.\d+)?$", s)
+    if m:
+        return int(float(s))
+    # last resort: strip everything not a digit or minus
+    s2 = re.sub(r"[^\d-]", "", s)
+    return int(s2) if s2 not in ("", "-",) else 0
+
+def _norm_status(s):
+    if s is None:
+        return ""
+    s = str(s).strip()
+    if s.lower() == "sent":
+        return "Dispatched"
+    # unify common variants
+    if s.lower().replace(" ", "") in ("intransit","in-transit"):
+        return "InTransit"
+    if s.lower() == "dispatched":
+        return "Dispatched"
+    if s.lower() == "delivered":
+        return "Delivered"
+    return s  # fallback unchanged
+
+def process_delivery_invoice_pdf(pdf_bytes: bytes, *, default_site: str = "Tunisia") -> list[dict]:
+    """
+    Parse a delivery invoice PDF (recognized via 'FACTURE') and return
+    records ready for DB: Site, AVOMaterialNo, DeliveryNo, Quantity, Date, Status.
+    - Merges PL/SP suffixes into AVOMaterialNo (e.g., 'V504.243 PL' -> 'V504.243PL')
+    - Pre-aggregates duplicates (sum Quantity) by (Site, AVOMaterialNo, DeliveryNo, Date, Status)
+    """
+    df = parse_delivery_pdf_bytes(pdf_bytes, default_site=default_site[:20])  # parser sets Status='Dispatched'
+    # Defensive normalization
+    for col in ["Site","AVOMaterialNo","DeliveryNo","Date","Status"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].map(_safestr)
+
+    # Merge PL/SP into AVOMaterialNo (idempotent)
+    df["AVOMaterialNo"] = df.apply(lambda r: _normalize_avo_ref(r.get("AVOMaterialNo"), None), axis=1)
+
+    # Clean qty and status
+    if "Quantity" not in df.columns:
+        df["Quantity"] = 0
+    df["Quantity"] = df["Quantity"].apply(_clean_qty).astype(int)
+    df["Status"] = df["Status"].apply(_norm_status)
+
+    # Pre-aggregate duplicates
+    key_cols = ["Site","AVOMaterialNo","DeliveryNo","Date","Status"]
+    if not df.empty:
+        df = (df.groupby(key_cols, as_index=False)["Quantity"].sum())
+        df = df[df["Quantity"] != 0].reset_index(drop=True)
+
+    return df.to_dict(orient="records")
+
+
+
+def insert_deliverydetails(df):
+    """
+    psycopg2 version — uses get_pg_connection() and merges/sums duplicates.
+    Expected df columns: Site, AVOMaterialNo, DeliveryNo, Date, Status, Quantity
+    """
+    import psycopg2
+
+    conn = get_pg_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+
+                def _sum_key(site, avo_mat, delivery_no, date, status):
+                    cur.execute("""
+                        SELECT COALESCE(SUM("Quantity"), 0)
+                        FROM public."DeliveryDetails"
+                        WHERE "Site"=%s AND "AVOMaterialNo"=%s AND "DeliveryNo"=%s AND "Date"=%s AND "Status"=%s
+                    """, (site, avo_mat, delivery_no, date, status))
+                    return int(cur.fetchone()[0] or 0)
+
+                def _delete_key(site, avo_mat, delivery_no, date, status):
+                    cur.execute("""
+                        DELETE FROM public."DeliveryDetails"
+                        WHERE "Site"=%s AND "AVOMaterialNo"=%s AND "DeliveryNo"=%s AND "Date"=%s AND "Status"=%s
+                    """, (site, avo_mat, delivery_no, date, status))
+
+                def _insert_row(site, avo_mat, delivery_no, date, status, qty):
+                    cur.execute("""
+                        INSERT INTO public."DeliveryDetails"
+                            ("Site","AVOMaterialNo","DeliveryNo","Quantity","Date","Status")
+                        VALUES (%s,%s,%s,%s,%s,%s)
+                    """, (site, avo_mat, delivery_no, int(qty), date, status))
+
+                def _merge_sum_key(site, avo_mat, delivery_no, date, status, delta_qty):
+                    existing = _sum_key(site, avo_mat, delivery_no, date, status)
+                    total = existing + int(delta_qty)
+                    _delete_key(site, avo_mat, delivery_no, date, status)
+                    if total > 0:
+                        _insert_row(site, avo_mat, delivery_no, date, status, total)
+
+                def _sum_intransit(site, avo_mat):
+                    cur.execute("""
+                        SELECT COALESCE(SUM("Quantity"), 0)
+                        FROM public."DeliveryDetails"
+                        WHERE "Site"=%s AND "AVOMaterialNo"=%s AND "Status"='InTransit'
+                    """, (site, avo_mat))
+                    return int(cur.fetchone()[0] or 0)
+
+                def _delete_all_intransit(site, avo_mat):
+                    cur.execute("""
+                        DELETE FROM public."DeliveryDetails"
+                        WHERE "Site"=%s AND "AVOMaterialNo"=%s AND "Status"='InTransit'
+                    """, (site, avo_mat))
+
+                def _rewrite_intransit(site, avo_mat, delivery_no, date, qty):
+                    _delete_all_intransit(site, avo_mat)
+                    if int(qty) > 0:
+                        _insert_row(site, avo_mat, delivery_no, date, "InTransit", int(qty))
+
+                # iterate normalized df
+                for _, row in df.iterrows():
+                    site        = _safestr(row.get("Site"))[:20]
+                    avo_mat     = _safestr(row.get("AVOMaterialNo"))[:30]
+                    delivery_no = _safestr(row.get("DeliveryNo"))[:30]
+                    date        = _safestr(row.get("Date"))[:20]
+                    qty         = _clean_qty(row.get("Quantity"))
+                    status      = _norm_status(row.get("Status"))
+
+                    if not (site and avo_mat and delivery_no and date and status):
+                        continue
+
+                    if status == "Dispatched":
+                        curr_it = _sum_intransit(site, avo_mat)
+                        _rewrite_intransit(site, avo_mat, delivery_no, date, curr_it + qty)
+                        _merge_sum_key(site, avo_mat, delivery_no, date, "Dispatched", qty)
+
+                    elif status == "Delivered":
+                        curr_it = _sum_intransit(site, avo_mat)
+                        new_it = max(0, curr_it - qty)
+                        _rewrite_intransit(site, avo_mat, delivery_no, date, new_it)
+                        _merge_sum_key(site, avo_mat, delivery_no, date, "Delivered", qty)
+
+                    elif status == "InTransit":
+                        curr_it = _sum_intransit(site, avo_mat)
+                        _rewrite_intransit(site, avo_mat, delivery_no, date, curr_it + qty)
+
+                    else:
+                        _merge_sum_key(site, avo_mat, delivery_no, date, status, qty)
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+
+
+
+
+
 
 @app.route("/process-TunisiaSite", methods=['POST'])
 def process_file_endpoint():
@@ -1165,7 +1566,7 @@ def process_file_endpoint():
     file_name = data['file_name']
     file_content_base64 = data['file_content_base64']
     file_type = data.get('file_type', None)
-    is_pdf = file_type == "pdf" or file_name.lower().endswith('.pdf')
+    is_pdf = (file_type == "pdf") or file_name.lower().endswith('.pdf')
 
     try:
         file_bytes = base64.b64decode(file_content_base64)
@@ -1176,45 +1577,52 @@ def process_file_endpoint():
     extracted_records = []
     company = None
     header = None
-    scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
-    if is_pdf:
+
+    # ---------- PDF path ----------
+    if is_pdf and _looks_like_pdf(file_bytes):
+        scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
+
+        # If scanned, your existing code returns an error. Keep behavior unless OCR is enabled.
         if scan_resp is not None:
-           # ocr_text = run_ocr_on_pdf(file_bytes)
-           # detected_format = detect_scanned_pdf_format(ocr_text)
-           # if detected_format == "spain":
-           #     extracted_records = process_spain_platform_ocr(ocr_text)
-           #     company = "Spain Platform"
-           # elif detected_format == "poland":
-           #     extracted_records = process_poland_platform_ocr(ocr_text)
-           #     company = "Poland Platform"
-           # else:
-                return jsonify({"error": "Unrecognized scanned PDF format."}), 400
-        else:
+            # If you later enable OCR, you can run it here and then search for 'FACTURE' in OCR text.
+            return jsonify({"error": "Unrecognized scanned PDF format."}), 400
 
-            pdf_format = detect_pdf_format(file_bytes)
-            if not pdf_format:
-                return jsonify({"error": "Unknown or unsupported PDF format."}), 400
-
-            if pdf_format == "valeo_campinas":
-                extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
-                company = "Valeo VWS Campinas"
-
-            elif pdf_format == "valeo_nevers":
-                extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
-                company = "Valeo CIE Nevers"
-
-            elif pdf_format == "pierburg":
-                extracted_records = process_pierburg_pdf(file_bytes, file_name)
-                company = "Pierburg"
-
-            elif pdf_format == "nidec":
-                extracted_records = process_nidec_pdf(file_bytes, file_name)
-                company = "Nidec"
-
+        # Not scanned: try FACTURE first (Delivery invoice)
+        try:
+            if _contains_facture(file_bytes):
+                # Site is Tunisia for this endpoint; keep <= 20 chars for schema
+                extracted_records = process_delivery_invoice_pdf(file_bytes, default_site="Tunisia")
+                company = "Delivery Invoice (FACTURE)"
             else:
-                return jsonify({"error": "Unrecognized PDF format."}), 400
+                # Fallback to your vendor-specific detectors
+                pdf_format = detect_pdf_format(file_bytes)
+                if not pdf_format:
+                    return jsonify({"error": "Unknown or unsupported PDF format."}), 400
 
+                if pdf_format == "valeo_campinas":
+                    extracted_records = process_valeo_campinas_pdf(file_bytes, file_name)
+                    company = "Valeo VWS Campinas"
 
+                elif pdf_format == "valeo_nevers":
+                    extracted_records = process_valeo_nevers_pdf(file_bytes, file_name)
+                    company = "Valeo CIE Nevers"
+
+                elif pdf_format == "pierburg":
+                    extracted_records = process_pierburg_pdf(file_bytes, file_name)
+                    company = "Pierburg"
+
+                elif pdf_format == "nidec":
+                    extracted_records = process_nidec_pdf(file_bytes, file_name)
+                    company = "Nidec"
+
+                else:
+                    return jsonify({"error": "Unrecognized PDF format."}), 400
+
+        except Exception as e:
+            logging.exception("PDF processing error")
+            return jsonify({"error": f"PDF processing error: {e}"}), 400
+
+    # ---------- CSV path ----------
     else:
         try:
             logging.warning(f"DEBUG: first 100 b64 chars: {file_content_base64[:100]}")
@@ -1246,16 +1654,67 @@ def process_file_endpoint():
         else:
             return jsonify({"error": "Unrecognized company type."}), 400
 
-    success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
-    return jsonify({
-        "message": "Processing completed.",
-        "file_processed": file_name,
-        "company_detected": company,
-        "records_processed": len(extracted_records),
-        "records_inserted": success_count,
-        "records_failed": len(error_details),
-        "errors": error_details
-    }), (200 if success_count > 0 else 400)
+    # ---------- Save to DB ----------
+    # If you prefer to re-use your central saver:
+    # ---------- Save to DB ----------
+    try:
+        # anything that contains "FACTURE" goes to DeliveryDetails
+        if company and "FACTURE" in str(company):
+            df = pd.DataFrame(extracted_records)
+            if df.empty:
+                return jsonify({"error": "No delivery lines parsed"}), 422
+
+            # ensure required columns exist
+            for col in ["Site","AVOMaterialNo","DeliveryNo","Date","Status","Quantity"]:
+                if col not in df.columns:
+                    df[col] = ""
+
+            # normalize and respect varchar lengths
+            df["Site"] = df["Site"].map(lambda s: _safestr(s)[:20])
+            df["AVOMaterialNo"] = df.apply(lambda r: _normalize_avo_ref(r.get("AVOMaterialNo"), None), axis=1)
+            df["AVOMaterialNo"] = df["AVOMaterialNo"].map(lambda s: _safestr(s)[:30])
+            df["DeliveryNo"] = df["DeliveryNo"].map(lambda s: _safestr(s)[:30])
+            df["Date"] = df["Date"].map(_safestr)
+            df["Status"] = df["Status"].map(_norm_status)
+            df["Quantity"] = df["Quantity"].apply(_clean_qty).astype(int)
+
+            # pre-aggregate duplicates
+            key_cols = ["Site","AVOMaterialNo","DeliveryNo","Date","Status"]
+            source_lines = len(df)
+            df = df.groupby(key_cols, as_index=False)["Quantity"].sum()
+            df = df[df["Quantity"] != 0].reset_index(drop=True)
+
+            # insert into DeliveryDetails (psycopg2 version)
+            insert_deliverydetails(df)
+
+            return jsonify({
+                "message": "Delivery invoice processed.",
+                "file_processed": file_name,
+                "company_detected": company,
+                "records_processed": int(source_lines),
+                "records_inserted": int(len(df)),
+                "records_failed": 0,
+                "errors": []
+            }), 200
+
+        # non-FACTURE flows (Vendor PDFs / CSVs) keep using the EDI saver
+        success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
+        return jsonify({
+            "message": "Processing completed.",
+            "file_processed": file_name,
+            "company_detected": company,
+            "records_processed": len(extracted_records),
+            "records_inserted": success_count,
+            "records_failed": len(error_details),
+            "errors": error_details
+        }), (200 if success_count > 0 else 400)
+
+    except Exception as e:
+        logging.exception("Database error")
+        return jsonify({"error": f"Database error: {e}"}), 400
+
+
+
 
 
 
@@ -1373,6 +1832,41 @@ def detect_client_info():
             return scan_resp, scan_status
 
         scanned_flag = False
+
+        # ✅ NEW: detect delivery invoice by the word "FACTURE"
+        try:
+            if _contains_facture(file_bytes):
+                company_name = "Delivery Invoice (FACTURE)"
+
+                # Optional: parse to get DeliveryNo/Date for a nicer suggested filename
+                try:
+                    recs = process_delivery_invoice_pdf(file_bytes, default_site="Tunisia")
+                except Exception:
+                    recs = []
+
+                dno = str((recs[0].get("DeliveryNo") if recs else None) or "unknown")
+                ddate = str((recs[0].get("Date") if recs else None) or "unknown")
+                suggested_name = f"delivery_invoice_{dno}_{ddate}{file_ext}".lower()
+
+                # Early return: this is a delivery invoice, not EDI
+                payload = {
+                    "file_processed": file_name,
+                    "client_code": "UNRECOGNIZED",     # invoices don’t carry EDI client code
+                    "company_detected": company_name,
+                    "forecast_week": None,
+                    "records_detected": len(recs),
+                    "suggested_filename": suggested_name,
+                    "file_type": "pdf",
+                    "file_recognition": True,
+                    "document_kind": "delivery_invoice",
+                    "is_scanned": scanned_flag
+                }
+                return jsonify(payload), 200
+        except Exception as e:
+            # If something goes wrong in the detection, fall through to the legacy flow
+            app.logger.warning(f"FACTURE detection failed for {file_name}: {e}")
+
+        # (legacy vendor PDF flow kept as-is)
         pdf_format = detect_pdf_format(file_bytes)
         if not pdf_format:
             return build_unknown_response(
@@ -1409,6 +1903,7 @@ def detect_client_info():
                 file_type="pdf",
                 is_scanned=scanned_flag,
             )
+
 
     # ---------- CSV HANDLING ----------
     else:
@@ -2689,4 +3184,3 @@ def product_capacity_stock():
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5001,debug=True)
 
-		
