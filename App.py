@@ -15,11 +15,9 @@ from collections import defaultdict , Counter
 import os
 from psycopg2.extras import execute_values
 from PyPDF2 import PdfReader
-from PIL import Image
 import json, gzip
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
-import sqlalchemy as sa
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -2527,11 +2525,7 @@ def process_file_endpoint_germany():
 
 
 
-
-
-
 # ========================= EDI ANALYSIS (FULL) =========================
-
 
 def _log(msg, *args):
     try:
@@ -2541,6 +2535,7 @@ def _log(msg, *args):
     logger.info(msg, *args)
 
 # ========================= HELPERS =========================
+
 WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")  # e.g., 2025-W07
 
 def norm_week_str(s: Optional[str]) -> Optional[str]:
@@ -2583,6 +2578,9 @@ def get_interval(week_diff_val: Optional[int]) -> str:
     if week_diff_val >= 25:       return "W+25 and more"
     return "Other"
 
+def interval_week_diff(interval: str) -> Optional[int]:
+    return {"W-1 to W": 1, "W+2 to W+5": 3, "W+6 to W+14": 8, "W+15 to W+24": 9, "W+25 and more": None}.get(interval)
+
 def get_allowed_change(interval: str) -> int:
     return {
         "W-1 to W": 0, "W+1": 0, "W+2 to W+5": 5,
@@ -2605,13 +2603,15 @@ def group_and_sum(rows: List[dict], group_keys: List[str], sum_key: str) -> List
     return out
 
 # ---------- Debug helpers ----------
+
 def debug_dump_deliveries(tag: str, rows: List[dict], limit: int = 8):
     _log("[DELIV:%s] fetched rows: %d", tag, len(rows))
     statuses = Counter([str(r.get("Status","")).strip().lower() for r in rows])
     _log("[DELIV:%s] statuses: %s", tag, dict(statuses))
     sites = Counter([str(r.get("Site","")).strip() for r in rows])
     _log("[DELIV:%s] top sites: %s", tag, sites.most_common(5))
-    prods = Counter([str(r.get("AVOMaterialNo") or r.get("ClientMaterialNo") or "") for r in rows])
+    # Products counted ONLY by AVOMaterialNo now that ClientMaterialNo is removed
+    prods = Counter([str(r.get("AVOMaterialNo") or "") for r in rows])
     _log("[DELIV:%s] top products: %s", tag, prods.most_common(5))
     for r in rows[:limit]:
         _log("[DELIV:%s][SAMPLE] %s", tag, r)
@@ -2643,24 +2643,16 @@ def debug_probe_deliverytable(product_codes: Optional[List[str]], sites: Optiona
             rows = cur.fetchall()
             _log("[DELIV:PROBE] top sites: %s", rows)
 
-            cur.execute('''
-                SELECT
-                  SUM(CASE WHEN "AVOMaterialNo" IS NOT NULL AND "AVOMaterialNo" <> '' THEN 1 ELSE 0 END) AS avo_filled,
-                  SUM(CASE WHEN ("AVOMaterialNo" IS NULL OR "AVOMaterialNo" = '') AND ("ClientMaterialNo" IS NOT NULL AND "ClientMaterialNo" <> '') THEN 1 ELSE 0 END) AS client_only
-                FROM "DeliveryDetails"
-            ''')
-            rows = cur.fetchall()
-            _log("[DELIV:PROBE] AVO filled vs client-only: %s", rows)
-
+            # Removed client-only probe; the column no longer exists.
             if product_codes:
                 cur.execute('''
                     SELECT COUNT(*)
                     FROM "DeliveryDetails"
                     WHERE UPPER(COALESCE("AVOMaterialNo", '')) = ANY(%s)
-                       OR UPPER(COALESCE("ClientMaterialNo", '')) = ANY(%s)
-                ''', ([p.upper() for p in product_codes], [p.upper() for p in product_codes]))
+                ''', ([p.upper() for p in product_codes],))
                 cnt = cur.fetchone()[0]
-                _log("[DELIV:PROBE] rows matching product_codes by AVO or ClientMaterialNo: %s", cnt)
+                _log("[DELIV:PROBE] rows matching product_codes by AVOMaterialNo: %s", cnt)
+
             if sites:
                 cur.execute('''
                     SELECT COUNT(*)
@@ -2678,6 +2670,7 @@ def debug_probe_deliverytable(product_codes: Optional[List[str]], sites: Optiona
             pass
 
 # ========================= DB FETCHERS =========================
+
 def fetch_ediglobal(
     weeks: List[str],
     client_codes: Optional[List[str]],
@@ -2713,29 +2706,27 @@ def fetch_deliverydetails_raw(
 ) -> List[dict]:
     """
     Fetch delivery rows broadly and normalize:
-    - Accept common status variants (IN TRANSIT, INTRANSIT, DISPATCHED, DELIVERED)
-    - Match products by AVO or ClientMaterialNo (case-insensitive)
+    - Accept common status variants (IN TRANSIT, INTRANSIT)
+    - Match products by AVOMaterialNo (case-insensitive)
     - Match Site case-insensitively, trimmed
     """
     prods_upper = [p.upper().strip() for p in product_codes] if product_codes else None
     sites_upper = [s.upper().strip() for s in sites] if sites else None
 
-    fields = '"Site","AVOMaterialNo","ClientMaterialNo","Date","Status","Quantity"'
+    # NOTE: ClientMaterialNo removed from both SELECT and filters.
+    fields = '"Site","AVOMaterialNo","Date","Status","Quantity"'
     sql = f'''
         SELECT {fields}
         FROM "DeliveryDetails"
-        WHERE UPPER(TRIM("Status")) IN ('IN TRANSIT','INTRANSIT','DISPATCHED','DELIVERED')
+        WHERE UPPER(TRIM("Status")) IN ('IN TRANSIT','INTRANSIT')
     '''
     params: List[Any] = []
 
     if prods_upper:
         sql += '''
-          AND (
-            UPPER(COALESCE("AVOMaterialNo", '')) = ANY(%s)
-            OR UPPER(COALESCE("ClientMaterialNo", '')) = ANY(%s)
-          )
+          AND UPPER(COALESCE("AVOMaterialNo", '')) = ANY(%s)
         '''
-        params.extend([prods_upper, prods_upper])
+        params.append(prods_upper)
 
     if sites_upper:
         sql += ' AND UPPER(TRIM("Site")) = ANY(%s)'
@@ -2760,8 +2751,48 @@ def fetch_deliverydetails(
     # Return ALL relevant delivery rows (no week filter)
     return fetch_deliverydetails_raw(product_codes, sites)
 
+# ========================= DB FETCHERS =========================
+def fetch_productdetails_map(
+    product_codes: Optional[List[str]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Return a mapping: AVOMaterialNo -> {"Line": <str or None>, "WeeklyCapacity": <float or None>}
+    Keys are added in both raw and UPPER() forms to ease lookups.
+    """
+    sql = 'SELECT "AVOMaterialNo","Line","WeeklyCapacity" FROM "ProductDetails"'
+    params: List[Any] = []
+    if product_codes:
+        sql += ' WHERE "AVOMaterialNo" = ANY(%s)'
+        params.append(product_codes)
+
+    conn = get_pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            out: Dict[str, Dict[str, Any]] = {}
+            for avo, line, cap in rows:
+                key_raw = str(avo or "").strip()
+                key_up  = key_raw.upper()
+                rec = {
+                    "Line": line,
+                    "WeeklyCapacity": float(cap) if cap is not None else None,
+                }
+                if key_raw:
+                    out[key_raw] = rec
+                    out[key_up]  = rec
+            return out
+    finally:
+        conn.close()
+
+
 # ========================= CORE ANALYSIS =========================
-def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[str, Any]:
+
+def run_edi_analysis(
+    edi_rows: List[dict],
+    delivery_rows: List[dict],
+    product_info: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
     # Normalize weeks + intervals on EDI
     for r in edi_rows:
         r["ForecastDate"] = norm_week_str(r.get("ForecastDate"))
@@ -2783,7 +2814,7 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
     in_transit_map: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for d in delivery_rows:
         site = (d.get("Site") or "").strip()
-        prod = (d.get("AVOMaterialNo") or d.get("ClientMaterialNo") or "").strip()
+        prod = (d.get("AVOMaterialNo") or "").strip()  # ClientMaterialNo removed
         if not site or not prod:
             continue
         try:
@@ -2807,6 +2838,7 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
 
     for i in range(len(all_ref_weeks) - 1):
         w1_ref, w2_ref = all_ref_weeks[i], all_ref_weeks[i + 1]
+        
         w1_data = rows_by_refweek.get(w1_ref, [])
         w2_data = rows_by_refweek.get(w2_ref, [])
 
@@ -2831,6 +2863,15 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
             variation_pct = round(100 * (difference / q1), 2) if q1 > 0 else 0.0
             allowed_change = get_allowed_change(interval)
             violation = abs(variation_pct) > allowed_change
+            required_w = q2
+            in_transit = in_transit_map.get(site, {}).get(str(product), 0.0)
+            coverage_ok = in_transit >= required_w
+
+            # ---- attach product meta (Line, WeeklyCapacity)
+            prod_key = str(product or "").strip()
+            info = product_info.get(prod_key) or product_info.get(prod_key.upper())
+            line = info.get("Line") if info else None
+            cap  = info.get("WeeklyCapacity") if info else None
 
             row = {
                 "Week_Comparison": f"{w1_ref}_vs_{w2_ref}",
@@ -2838,16 +2879,19 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
                 "ClientCode": client,
                 "AVOMaterialNo": product,
                 "Interval": interval,
+                "Interval_Week_Diff": interval_week_diff(interval),
                 "Quantity_W1": q1,
                 "Quantity_W2": q2,
                 "Difference": difference,
                 "Variation_Pct": f"{variation_pct}%",
                 "Allowed_Change_%": allowed_change,
                 "Violation": violation,
-                "InTransit": "",
-                "Required_W": "",
-                "Coverage_OK": "",
-                "Delivery_Issue": "",
+                "InTransit": in_transit,
+                "Required_W": required_w,
+                "Coverage_OK": coverage_ok,
+                "Delivery_Issue": not coverage_ok,
+                "Line": line,
+                "WeeklyCapacity": cap,
             }
 
             if interval == "W-1 to W":
@@ -2864,7 +2908,7 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
 
             detailed_report.append(row)
 
-    # Summary
+    # Summary (unchanged)
     summary_per_group = []
     start_ref, end_ref = all_ref_weeks[0], all_ref_weeks[-1]
     for key, weekly_quantities in all_quantities_by_key.items():
@@ -2886,7 +2930,7 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
             "Total_Cumulated_Percentage_Variation": f"{total_pct_var}%"
         })
 
-    # Sheets
+    # Sheets (carry Line & WeeklyCapacity via detailed_report rows)
     green_sheet, red_sheet = [], []
     for r in detailed_report:
         is_green = (r["Interval"] == "W-1 to W" and r.get("Coverage_OK") is True) or (r.get("Violation") is False)
@@ -2900,8 +2944,14 @@ def run_edi_analysis(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[st
 
     return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet}
 
+
 # ---------- single-week analysis (coverage-only) ----------
-def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict[str, Any]:
+
+def analyze_single_week(
+    edi_rows: List[dict],
+    delivery_rows: List[dict],
+    product_info: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
     for r in edi_rows:
         r["ForecastDate"] = norm_week_str(r.get("ForecastDate"))
         r["DateFrom"]     = norm_week_str(r.get("DateFrom"))
@@ -2917,7 +2967,7 @@ def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict
     in_transit_map: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for d in delivery_rows:
         site = (d.get("Site") or "").strip()
-        prod = (d.get("AVOMaterialNo") or d.get("ClientMaterialNo") or "").strip()
+        prod = (d.get("AVOMaterialNo") or "").strip()  # ClientMaterialNo removed
         if not site or not prod:
             continue
         try:
@@ -2942,12 +2992,21 @@ def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict
     for g in grouped:
         site, client, product, interval = g["Site"], g["ClientCode"], g["AVOMaterialNo"], g["Interval"]
         q = float(g["Quantity"] or 0)
+
+        # ---- attach product meta (Line, WeeklyCapacity)
+        prod_key = str(product or "").strip()
+        info = product_info.get(prod_key) or product_info.get(prod_key.upper())
+        line = info.get("Line") if info else None
+        cap  = info.get("WeeklyCapacity") if info else None
+
         row = {
             "Week_Comparison": f"{w_ref}_single",
+            "Interval_Week_Diff": interval_week_diff(interval),
             "Site": site, "ClientCode": client, "AVOMaterialNo": product, "Interval": interval,
             "Quantity_W1": q, "Quantity_W2": q, "Difference": 0.0, "Variation_Pct": "0.0%",
             "Allowed_Change_%": get_allowed_change(interval), "Violation": False,
-            "InTransit": "", "Required_W": "", "Coverage_OK": "", "Delivery_Issue": ""
+            "InTransit": "", "Required_W": "", "Coverage_OK": "", "Delivery_Issue": "",
+            "Line": line, "WeeklyCapacity": cap,
         }
         if interval == "W-1 to W":
             required_w = q
@@ -2958,7 +3017,7 @@ def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict
 
         detailed_report.append(row)
 
-    # summary: zeros (single-week)
+    # summary: zeros (single-week) — unchanged
     summary_per_group = []
     for g in grouped:
         summary_per_group.append({
@@ -2966,7 +3025,7 @@ def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict
             "Total_Cumulated_Quantity_Difference": 0.0, "Total_Cumulated_Percentage_Variation": "0.0%"
         })
 
-    # sheets
+    # sheets (Line & WeeklyCapacity ride along in detailed rows)
     green_sheet, red_sheet = [], []
     for r in detailed_report:
         is_green = (r["Interval"] == "W-1 to W" and r.get("Coverage_OK") is True) or (r.get("Violation") is False)
@@ -2980,7 +3039,9 @@ def analyze_single_week(edi_rows: List[dict], delivery_rows: List[dict]) -> Dict
 
     return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet, "analysis_mode": "single_week"}
 
+
 # ========================= ROUTE =========================
+
 @app.route("/edi-analysis", methods=["POST"])
 def edi_analysis_run():
     try:
@@ -3007,20 +3068,30 @@ def edi_analysis_run():
         debug_probe_deliverytable(product_codes, sites)
         delivery_rows = fetch_deliverydetails(weeks, product_codes, sites)
 
-        _log("[ROUTE] fetched edi_rows=%d delivery_rows=%d", len(edi_rows), len(delivery_rows))
+        # Product meta (Line, WeeklyCapacity) for relevant products
+        prods_for_meta = product_codes or sorted({
+            str(r.get("AVOMaterialNo") or "").strip()
+            for r in edi_rows if r.get("AVOMaterialNo")
+        })
+        product_info = fetch_productdetails_map(prods_for_meta)
+
+        _log("[ROUTE] fetched edi_rows=%d delivery_rows=%d product_meta=%d",
+             len(edi_rows), len(delivery_rows), len(product_info))
 
         # Single-week coverage mode OR multi-week full analysis
         if len(weeks) == 1:
-            result = analyze_single_week(edi_rows, delivery_rows)
+            result = analyze_single_week(edi_rows, delivery_rows, product_info)
         else:
-            result = run_edi_analysis(edi_rows, delivery_rows)
+            result = run_edi_analysis(edi_rows, delivery_rows, product_info)
 
         return jsonify({"status":"ok","data":result}), 200
 
     except Exception as e:
         return jsonify({"status":"error","message":str(e)}), 500
 
+
 # ---------- robust payload parsing ----------
+
 def _coerce_list(v):
     """Accept list, single string, CSV string, numbers; return list[str] or None."""
     if v is None:
