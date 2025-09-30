@@ -39,22 +39,96 @@ def decode_base64_csv(b64_string):
         logging.error(f"Base64 decoding error: {e}")
         raise
 
+
+_BOM = "\ufeff"
+
+def _normalize_colname(name):
+    if isinstance(name, str):
+        return name.replace(_BOM, "").strip()
+    return name
+
+def _find_col_index(header, wanted_names):
+    """
+    Returns the original index in `header` for any of the wanted_names,
+    after normalizing BOM/whitespace.
+    """
+    norm_map = { _normalize_colname(col): i for i, col in enumerate(header) }
+    for w in wanted_names:
+        w_norm = _normalize_colname(w)
+        if w_norm in norm_map:
+            return norm_map[w_norm]
+    return None
+
 def detect_company_and_prepare(rows):
+    logging.warning(f"DEBUG: starting detect_company_and_prepare; rows_count={0 if rows is None else len(rows)}")
+
     if not rows:
+        logging.warning("DEBUG: rows empty or None -> returning (None, [])")
         return None, []
+
     header = rows[0]
-    if 'Org_Name_Customer' in header:
-        org_col = header.index('Org_Name_Customer')
-        if any(r[org_col].strip() == 'Valeo' for r in rows[1:] if len(r) > org_col):
+    logging.warning(f"DEBUG: header_len={len(header)}; header_preview={header}")
+
+    # --- Valeo via 'Org_Name_Customer'
+    org_col = _find_col_index(header, ["Org_Name_Customer"])
+    if org_col is not None:
+        logging.warning(f"DEBUG: 'Org_Name_Customer' index={org_col}")
+        matches = 0
+        sample_vals = []
+        for r in rows[1:]:
+            v = r[org_col].strip() if len(r) > org_col and isinstance(r[org_col], str) else ""
+            if len(sample_vals) < 8:
+                sample_vals.append(v)
+            if v == 'Valeo':
+                matches += 1
+        logging.warning(f"DEBUG: Valeo check -> matches={matches}; sample_vals={sample_vals}")
+        if matches:
+            logging.warning("DEBUG: Detected company='Valeo'")
             return 'Valeo', header
-    if 'Site/Building' in header:
-        site_col = header.index('Site/Building')
-        if any(r[site_col].strip() in ['ESS2', 'GAD1'] for r in rows[1:] if len(r) > site_col):
+    else:
+        logging.warning("DEBUG: header missing 'Org_Name_Customer'")
+
+    # --- Inteva via 'Site/Building' in ['ESS2', 'GAD1']
+    site_col = _find_col_index(header, ["Site/Building"])
+    if site_col is not None:
+        logging.warning(f"DEBUG: 'Site/Building' index={site_col}")
+        targets = {'ESS2', 'GAD1'}
+        matches = 0
+        sample_vals = []
+        for r in rows[1:]:
+            v = r[site_col].strip() if len(r) > site_col and isinstance(r[site_col], str) else ""
+            if len(sample_vals) < 8:
+                sample_vals.append(v)
+            if v in targets:
+                matches += 1
+        logging.warning(f"DEBUG: Inteva check targets={list(targets)} -> matches={matches}; sample_vals={sample_vals}")
+        if matches:
+            logging.warning("DEBUG: Detected company='Inteva'")
             return 'Inteva', header
-    if 'Plant' in header:
-        plant_col = header.index('Plant')
-        if any(r[plant_col].strip() in ['BI01', 'ZI01', 'SPER'] for r in rows[1:] if len(r) > plant_col):
+    else:
+        logging.warning("DEBUG: header missing 'Site/Building'")
+
+    # --- Nidec via 'Plant' or '\ufeffPlant' in ['BI01', 'ZI01', 'SPER']
+    plant_col = _find_col_index(header, ["Plant", "\ufeffPlant"])
+    if plant_col is not None:
+        logging.warning(f"DEBUG: 'Plant' index={plant_col} (handles BOM)")
+        targets = {'BI01', 'ZI01', 'SPER'}
+        matches = 0
+        sample_vals = []
+        for r in rows[1:]:
+            v = r[plant_col].strip() if len(r) > plant_col and isinstance(r[plant_col], str) else ""
+            if len(sample_vals) < 8:
+                sample_vals.append(v)
+            if v in targets:
+                matches += 1
+        logging.warning(f"DEBUG: Nidec check targets={list(targets)} -> matches={matches}; sample_vals={sample_vals}")
+        if matches:
+            logging.warning("DEBUG: Detected company='Nidec'")
             return 'Nidec', header
+    else:
+        logging.warning("DEBUG: header missing 'Plant' (including BOM variant)")
+
+    logging.warning("DEBUG: No company detected; returning (None, header)")
     return None, header
 
 
@@ -290,10 +364,27 @@ def process_inteva_rows(rows, header):
     return processed
 
 
+def _normalize_colname(name: str) -> str:
+    # strip UTF-8/UTF-16 BOM if present and trim whitespace
+    if isinstance(name, str):
+        return name.replace(_BOM, "").strip()
+    return name
+
+def _build_index(header):
+    """
+    Build an index dict using *normalized* header names.
+    Example: {'Plant': 3, 'CallOffDate': 4, ...}
+    """
+    norm_header = [_normalize_colname(c) for c in header]
+    idx = {col: i for i, col in enumerate(norm_header)}
+    # debug visibility
+    if header and header[0] != norm_header[0]:
+        logging.warning(f"DEBUG: BOM detected in first header cell; raw='{header[0]}', normalized='{norm_header[0]}'")
+    logging.warning(f"DEBUG: header normalized => {norm_header}")
+    return idx
 
 def process_nidec_rows(rows, header):
     # New mapping: Old Part N° (current AVOMaterialNo) -> New Part N°
-    # (includes fix: 'V504.510' maps to 'V504.510 PL' with the missing 'V' restored)
     NEW_AVO_MAPPING = {
         # Nidec ESP
         "VA18116507G": "V504.519SP",
@@ -307,7 +398,6 @@ def process_nidec_rows(rows, header):
     }
 
     def apply_new_mapping(avo_code: str) -> str:
-        """Return mapped AVOMaterialNo if in mapping; otherwise original."""
         mapped = NEW_AVO_MAPPING.get(avo_code.strip(), avo_code)
         if mapped != avo_code:
             logging.warning(f"DEBUG: AVOMaterialNo mapped '{avo_code}' -> '{mapped}'")
@@ -318,51 +408,49 @@ def process_nidec_rows(rows, header):
         "SPER": "C00050",
         "BI01": "C00113",
     }
+
+    if not rows:
+        logging.warning("DEBUG: rows empty or None -> returning []")
+        return []
+
+    # --- BOM-aware header index
+    idx = _build_index(header)
+
+    # Required fields (normalized)
+    required_fields = [
+        'Plant', 'CallOffDate', 'Material', 'DateFrom', 'DateUntil', 'DespatchQty',
+        'LastDeliveryDate', 'LastDeliveryQuantity', 'CumQuantity', 'Status', 'LastDeliveryNo'
+    ]
+    missing = [f for f in required_fields if f not in idx]
+    if missing:
+        logging.error(f"Column(s) missing in Nidec CSV (normalized): {missing}")
+        return []
+
     processed = []
-    idx = {col: header.index(col) for col in header}
 
-    def make_avo_material_code(code):
-        code = code.strip()
-        if code == "502-730-99-99":
-            return "VA13116595N"
-        # If contains any letter, just add V in front
-        if re.search(r'[a-zA-Z]', code):
-            return "V" + code
-        # Else, expect format like 503-996-99-99, take first two parts
-        parts = code.split('-')
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            return f"V{parts[0]}.{parts[1]}"
-        # Fallback: just add V
-        return "V" + code
-
-    # Check all required fields exist
-    required_fields = ['Plant', 'CallOffDate', 'Material', 'DateFrom', 'DateUntil', 'DespatchQty', 'LastDeliveryDate', 'LastDeliveryQuantity', 'CumQuantity', 'Status', 'LastDeliveryNo']
-    for f in required_fields:
-        if f not in idx:
-            logging.error(f"Column missing in Nidec CSV: {f}")
-            return []  # Exit early, can't process
-
+    # quick shape sanity
     for i, row in enumerate(rows[1:], 1):
         if len(row) != len(header):
             logging.warning(f"Row length mismatch at row {i}: {len(row)} fields vs header {len(header)}. Row: {row}")
-            continue
 
     for i, row in enumerate(rows[1:]):
         try:
             if len(row) < len(header):
                 row += [""] * (len(header) - len(row))
 
-            plant = row[idx['Plant']].strip()
+            plant_raw = row[idx['Plant']]
+            plant = plant_raw.strip() if isinstance(plant_raw, str) else ""
             if plant not in plant_to_client:
                 logging.warning(f"SKIP row {i+1}: Plant '{plant}' not recognized in plant_to_client")
                 continue
 
-            client_code = plant_to_client.get(plant, None)
+            client_code = plant_to_client.get(plant)
             if not client_code:
                 logging.warning(f"SKIP row {i+1}: No client_code for plant '{plant}'")
                 continue
 
-            call_off_date_str = row[idx['CallOffDate']].strip()
+            call_off_date_str = (row[idx['CallOffDate']].strip()
+                                 if isinstance(row[idx['CallOffDate']], str) else "")
             logging.warning(f"DEBUG: Row {i+1}: CallOffDate = '{call_off_date_str}'")
             if not call_off_date_str:
                 logging.warning(f"SKIP row {i+1}: Empty CallOffDate")
@@ -377,33 +465,55 @@ def process_nidec_rows(rows, header):
                     logging.warning(f"SKIP row {i+1}: Unparsable CallOffDate '{call_off_date_str}'")
                     continue
 
-            # All OK - continue with record as before
+            # ISO week; shift if day > Tuesday (like your original logic)
             week_num = date_obj.isocalendar()[1]
             if date_obj.weekday() > 1:
                 week_num += 1
             forecast_date = f"{date_obj.year}-W{week_num:02d}"
 
-            material_code = row[idx['Material']].strip()
-            avo_material_code = make_avo_material_code(material_code)
+            material_val = row[idx['Material']]
+            material_code = material_val.strip() if isinstance(material_val, str) else ""
+            # --- make AVOMaterialNo
+            def make_avo_material_code(code):
+                code = code.strip()
+                if code == "502-730-99-99":
+                    return "VA13116595N"
+                # If contains any letter, just add V in front
+                if re.search(r'[a-zA-Z]', code):
+                    return "V" + code
+                # Else, expect format like 503-996-99-99, take first two parts
+                parts = code.split('-')
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    return f"V{parts[0]}.{parts[1]}"
+                # Fallback: just add V
+                return "V" + code
 
-            # ✅ Apply the new mapping to the computed AVOMaterialNo
+            avo_material_code = make_avo_material_code(material_code)
             avo_material_code_mapped = apply_new_mapping(avo_material_code)
 
             processed.append({
                 "Site": "Tunisia",
                 "ClientCode": client_code,
-                "ClientMaterialNo": material_code,                         # as is from the file
-                "AVOMaterialNo": avo_material_code_mapped,                 # transformed + mapped
-                "DateFrom": to_forecast_week(row[idx['DateFrom']].strip()),
-                "DateUntil": row[idx['DateUntil']].strip(),
-                "Quantity": parse_euro_number(row[idx['DespatchQty']].strip()),
+                "ClientMaterialNo": material_code,
+                "AVOMaterialNo": avo_material_code_mapped,
+                "DateFrom": to_forecast_week((row[idx['DateFrom']].strip()
+                                              if isinstance(row[idx['DateFrom']], str) else "")),
+                "DateUntil": (row[idx['DateUntil']].strip()
+                              if isinstance(row[idx['DateUntil']], str) else ""),
+                "Quantity": parse_euro_number((row[idx['DespatchQty']].strip()
+                                               if isinstance(row[idx['DespatchQty']], str) else "")),
                 "ForecastDate": forecast_date,
-                "LastDeliveryDate": to_forecast_week(row[idx['LastDeliveryDate']].strip()),
-                "LastDeliveredQuantity": parse_euro_number(row[idx['LastDeliveryQuantity']].strip()),
-                "CumulatedQuantity": parse_euro_number(row[idx['CumQuantity']].strip()),
-                "EDIStatus": row[idx['Status']].strip(),
+                "LastDeliveryDate": to_forecast_week((row[idx['LastDeliveryDate']].strip()
+                                                      if isinstance(row[idx['LastDeliveryDate']], str) else "")),
+                "LastDeliveredQuantity": parse_euro_number((row[idx['LastDeliveryQuantity']].strip()
+                                                            if isinstance(row[idx['LastDeliveryQuantity']], str) else "")),
+                "CumulatedQuantity": parse_euro_number((row[idx['CumQuantity']].strip()
+                                                        if isinstance(row[idx['CumQuantity']], str) else "")),
+                "EDIStatus": (row[idx['Status']].strip()
+                              if isinstance(row[idx['Status']], str) else ""),
                 "ProductName": None,
-                "LastDeliveryNo": row[idx['LastDeliveryNo']].strip()
+                "LastDeliveryNo": (row[idx['LastDeliveryNo']].strip()
+                                   if isinstance(row[idx['LastDeliveryNo']], str) else "")
             })
         except Exception as e:
             logging.error(f"Nidec row processing error at row {i+1}: {e}")
