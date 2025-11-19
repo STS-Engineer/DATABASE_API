@@ -169,39 +169,73 @@ def to_forecast_week(raw):
     return ""
 
 
-def process_valeo_rows(rows, header):
+
+    def process_valeo_rows(rows, header):
     plant_to_client = {
         "SK01": "C00250",
         "W113": "C00303",
         "FUEN": "C00125",
         "BN01": "C00132",
     }
+
+    # Client material → AVOMaterialNo mapping (Valeo-specific)
+    material_to_avo = {
+        "473801": "V473801",
+        "469917D": "V469.917D",      # as you specified
+        "471346D": "V471.346D",
+        "471553D": "V471.553D",
+        "W000023134D": "VW000023134",
+    }
+
     processed = []
     idx = {col: header.index(col) for col in header}
+
     for row in rows[1:]:
         try:
+            # Skip header/garbage line if Customer_No is not numeric
             if 'Customer_No' in idx and not row[idx['Customer_No']].isnumeric():
                 continue
+
             plant = row[idx['Plant_No']].strip()
             client_code = plant_to_client.get(plant, None)
             if not client_code:
+                # Unknown plant → skip line
                 continue
+
             delivery_date = row[idx['Delivery_Date']].strip()
             date_str = row[idx['Date']].strip()
+
+            # Parse date and compute forecast week
             try:
                 date_obj = datetime.strptime(date_str, "%Y-%m-%d")
             except ValueError:
                 date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+
             week_num = date_obj.isocalendar()[1]
+            # If after Tuesday, push to next week
             if date_obj.weekday() > 1:
                 week_num += 1
             forecast_date = f"{date_obj.year}-W{week_num:02d}"
-            material_code = row[idx['Material_No_Customer']].strip()
-            AVOmaterial_code = material_code if material_code.startswith("V") else "V" + material_code
-            if client_code == "C00250":
-                AVOmaterial_code += "POL"
-            elif client_code == "C00303":
-                AVOmaterial_code += "SLP"
+
+            # --- Material + AVO mapping logic ---
+            material_code = row[idx['Material_No_Customer']].strip().upper()
+
+            # 1) Try explicit mapping first
+            mapped_avo = material_to_avo.get(material_code)
+
+            if mapped_avo:
+                AVOmaterial_code = mapped_avo
+            else:
+                # 2) Fallback to old logic (V + material + POL/SLP)
+                AVOmaterial_code = (
+                    material_code if material_code.startswith("V")
+                    else "V" + material_code
+                )
+                if client_code == "C00250":
+                    AVOmaterial_code += "POL"
+                elif client_code == "C00303":
+                    AVOmaterial_code += "SLP"
+
             processed.append({
                 "Site": "Tunisia",
                 "ClientCode": client_code,
@@ -226,6 +260,7 @@ def process_valeo_rows(rows, header):
 
         except Exception as e:
             logging.error(f"Valeo row processing error: {e}")
+
     logging.warning(f"DEBUG: Valeo processed {len(processed)} records from {len(rows)-1} data rows")
     return processed
 
