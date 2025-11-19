@@ -170,7 +170,7 @@ def to_forecast_week(raw):
 
 
 
-    def process_valeo_rows(rows, header):
+def process_valeo_rows(rows, header):
     plant_to_client = {
         "SK01": "C00250",
         "W113": "C00303",
