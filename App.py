@@ -18,7 +18,7 @@ from PyPDF2 import PdfReader
 import json, gzip
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
-
+import requests
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
