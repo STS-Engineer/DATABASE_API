@@ -1694,6 +1694,116 @@ def insert_deliverydetails(df):
 
 
 
+OCR_SERVICE_URL = "https://ocr-files-cdh9dbaqf2cufdgs.francecentral-01.azurewebsites.net/process-base64"
+
+
+
+# ---------------------------------------------------------
+# >>> NEW HELPER FUNCTIONS FOR OCR & PARSING <<<
+# ---------------------------------------------------------
+
+month_map_pl = {
+    'sty': '01', 'lut': '02', 'mar': '03', 'kwi': '04', 'maj': '05', 'cze': '06',
+    'lip': '07', 'sie': '08', 'wrz': '09', 'paź': '10', 'paz': '10', 'lis': '11', 'gru': '12'
+}
+
+def parse_polish_date_ocr(date_str):
+    """Converts '2.lip.2025' to '2025-07-02'"""
+    try:
+        clean_str = date_str.strip(' .')
+        parts = clean_str.split('.')
+        if len(parts) != 3:
+            return date_str 
+        day, month_txt, year = parts
+        month_digit = month_map_pl.get(month_txt.lower(), '01')
+        return f"{year}-{month_digit}-{day.zfill(2)}"
+    except Exception:
+        return date_str
+
+def extract_delivery_data_from_text(ocr_text):
+    """
+    Parses the raw text from OCR based on the specific Delivery Note logic.
+    Adds 'POL' suffix to AVOMaterialNo if 'Poland' is detected in text.
+    """
+    # Normalize text
+    text = " ".join(ocr_text.split())
+
+    # --- 1. Context Check: Detect Poland ---
+    is_poland = "poland" in text.lower()
+
+    # --- 2. DeliveryNo ---
+    delivery_no = "UNKNOWN"
+    match_no = re.search(r'Delivery Note\s+(.*?)\s+Loading place', text, re.IGNORECASE)
+    if match_no:
+        delivery_no = match_no.group(1).strip()
+
+    # --- 3. DeliveryDate ---
+    delivery_date = datetime.now().strftime("%Y-%m-%d") 
+    match_date = re.search(r'Delivery Date\s+([\d]{1,2}\.[a-zA-Z]{3}\.[\d]{4})', text, re.IGNORECASE)
+    if match_date:
+        raw_date = match_date.group(1).strip()
+        delivery_date = parse_polish_date_ocr(raw_date)
+
+    # --- 4. Quantities ---
+    quantities = []
+    match_qty = re.search(r'Qty pcs\s+(.*?)\s+Remarks', text, re.IGNORECASE)
+    if match_qty:
+        qty_string = match_qty.group(1)
+        quantities = [int(q) for q in qty_string.split() if q.isdigit()]
+
+    # --- 5. AVO Materials ---
+    avo_materials = []
+    match_31 = re.search(r'\s31\s+(.*)', text)
+    if match_31:
+        after_31_text = match_31.group(1)
+        tokens = after_31_text.split()
+        # Capture tokens starting with V
+        potential_avos = [t for t in tokens if t.startswith('V')]
+        limit = len(quantities)
+        avo_materials = potential_avos[:limit]
+
+    # --- 6. Construct Rows for DataFrame ---
+    results = []
+    for i in range(len(quantities)):
+        mat_no = avo_materials[i] if i < len(avo_materials) else "UNKNOWN"
+        
+        # >>> NEW LOGIC: Append POL if applicable <<<
+        if is_poland and mat_no != "UNKNOWN":
+            mat_no = f"{mat_no}PL"
+
+        results.append({
+            "Site": "Tunisia",
+            "AVOMaterialNo": mat_no,
+            "DeliveryNo": delivery_no,
+            "Date": delivery_date,
+            "Status": "Delivered",
+            "Quantity": quantities[i]
+        })
+        
+    return results
+
+
+
+def perform_ocr_on_base64(file_base64, filename):
+    """
+    Sends the Base64 string to the local OCR service and returns the raw text.
+    """
+    payload = {
+        "file_name": filename,
+        "file_content_base64": file_base64,
+        "max_pages": 5 
+    }
+    try:
+        response = requests.post(OCR_SERVICE_URL, json=payload, timeout=60)
+        if response.status_code == 200:
+            return response.json().get("text", "")
+        else:
+            logging.error(f"OCR Service failed: {response.text}")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to connect to OCR service: {e}")
+        return None
+
 
 
 
