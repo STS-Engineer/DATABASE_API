@@ -1833,12 +1833,46 @@ def process_file_endpoint():
 
     # ---------- PDF path ----------
     if is_pdf and _looks_like_pdf(file_bytes):
+        
+        # Check if it is scanned
         scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
 
-        # If scanned, your existing code returns an error. Keep behavior unless OCR is enabled.
+        # >>> MODIFIED LOGIC: If scanned, try OCR instead of erroring <<<
         if scan_resp is not None:
-            # If you later enable OCR, you can run it here and then search for 'FACTURE' in OCR text.
-            return jsonify({"error": "Unrecognized scanned PDF format."}), 400
+            logging.info(f"File {file_name} detected as scanned. Attempting OCR...")
+            
+            # 1. Call OCR Service
+            ocr_text = perform_ocr_on_base64(file_content_base64, file_name)
+            
+            if ocr_text:
+                # 2. Parse the OCR text using your specific logic
+                try:
+                    parsed_data = extract_delivery_data_from_text(ocr_text)
+                    
+                    if parsed_data:
+                        # 3. Save to DeliveryDetails
+                        df_ocr = pd.DataFrame(parsed_data)
+                        insert_deliverydetails(df_ocr)
+                        
+                        return jsonify({
+                            "message": "Scanned PDF processed via OCR.",
+                            "file_processed": file_name,
+                            "company_detected": "Valeo/Nidec (OCR)",
+                            "records_processed": len(parsed_data),
+                            "records_inserted": len(parsed_data),
+                            "records_failed": 0,
+                            "errors": []
+                        }), 200
+                    else:
+                        return jsonify({"error": "OCR succeeded but no delivery data extracted matches criteria."}), 422
+                        
+                except Exception as e:
+                    logging.error(f"Error parsing OCR text: {e}")
+                    return jsonify({"error": f"Error parsing OCR result: {e}"}), 500
+            else:
+                 # OCR Failed: Return the original 'is_scanned' error response
+                 logging.warning("OCR service returned no text or failed.")
+                 return scan_resp, scan_status
 
         # Not scanned: try FACTURE first (Delivery invoice)
         try:
@@ -1908,8 +1942,6 @@ def process_file_endpoint():
             return jsonify({"error": "Unrecognized company type."}), 400
 
     # ---------- Save to DB ----------
-    # If you prefer to re-use your central saver:
-    # ---------- Save to DB ----------
     try:
         # anything that contains "FACTURE" goes to DeliveryDetails
         if company and "FACTURE" in str(company):
@@ -1952,6 +1984,9 @@ def process_file_endpoint():
 
         # non-FACTURE flows (Vendor PDFs / CSVs) keep using the EDI saver
         success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
+        logging.warning(
+        f"DEBUG: DB result for {file_name}: inserted={success_count}, errors={len(error_details)}"
+    )
         return jsonify({
             "message": "Processing completed.",
             "file_processed": file_name,
