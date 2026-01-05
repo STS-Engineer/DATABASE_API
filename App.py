@@ -9,7 +9,7 @@ import psycopg2
 import pdfplumber
 import PyPDF2
 from psycopg2 import errors
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import re
 from collections import defaultdict , Counter
 import os
