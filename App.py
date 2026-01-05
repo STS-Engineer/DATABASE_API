@@ -4345,6 +4345,106 @@ def send_report_endpoint():
 
 
 
+# ========================= DATA RETRIEVAL APIS =========================
+
+@app.route("/get-delivery-details", methods=["POST"])
+def get_delivery_details():
+    """Retrieves records from DeliveryDetails with optional filters."""
+    try:
+        body = _extract_body()
+        sites = _coerce_list(body.get("sites"))
+        avo_materials = _coerce_list(body.get("AVOMaterialNo"))
+        statuses = _coerce_list(body.get("statuses"))
+
+        sql = 'SELECT * FROM public."DeliveryDetails" WHERE 1=1'
+        params = []
+
+        if sites:
+            sql += ' AND "Site" = ANY(%s)'
+            params.append(sites)
+        if avo_materials:
+            sql += ' AND "AVOMaterialNo" = ANY(%s)'
+            params.append(avo_materials)
+        if statuses:
+            sql += ' AND "Status" = ANY(%s)'
+            params.append(statuses)
+
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.close()
+
+        return jsonify({"status": "success", "count": len(rows), "data": rows}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/get-edi-global", methods=["POST"])
+def get_edi_global():
+    """Retrieves records from EDIGlobal, typically filtered by ForecastDate."""
+    try:
+        body = _extract_body()
+        forecast_weeks = _coerce_list(body.get("forecastWeeks"))
+        client_codes = _coerce_list(body.get("clientCodes"))
+        avo_materials = _coerce_list(body.get("AVOMaterialNo"))
+
+        sql = 'SELECT * FROM public."EDIGlobal" WHERE 1=1'
+        params = []
+
+        if forecast_weeks:
+            sql += ' AND "ForecastDate" = ANY(%s)'
+            params.append(forecast_weeks)
+        if client_codes:
+            sql += ' AND "ClientCode" = ANY(%s)'
+            params.append(client_codes)
+        if avo_materials:
+            sql += ' AND "AVOMaterialNo" = ANY(%s)'
+            params.append(avo_materials)
+
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.close()
+
+        return jsonify({"status": "success", "count": len(rows), "data": rows}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/get-product-details", methods=["GET", "POST"])
+def get_product_details_route():
+    """
+    GET: Returns all products.
+    POST: Returns specific products via AVOMaterialNo list.
+    """
+    try:
+        sql = 'SELECT * FROM public."ProductDetails"'
+        params = []
+
+        if request.method == "POST":
+            body = _extract_body()
+            avo_materials = _coerce_list(body.get("AVOMaterialNo"))
+            if avo_materials:
+                sql += ' WHERE "AVOMaterialNo" = ANY(%s)'
+                params.append(avo_materials)
+
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.close()
+
+        return jsonify({"status": "success", "count": len(rows), "data": rows}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
+
+
+
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5001,debug=True)
