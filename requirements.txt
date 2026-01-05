@@ -1,4 +1,4 @@
-﻿Flask
+Flask
 PyMuPDF
 psycopg2-binary
 python-dotenv
@@ -7,9 +7,11 @@ PyPDF2
 Pillow
 pandas
 SQLAlchemy
-
 python-dateutil
-
 requests
-Flask-Mail
+Flask-Mail 
+pandas 
+openpyxl 
+xlsxwriter
+
 openai
