@@ -19,10 +19,28 @@ import json, gzip
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
+from flask_mail import Mail, Message
+import openai
+# ... existing imports ...
+
+app = Flask(__name__)
+
+# --- Flask-Mail Configuration (Outlook SMTP) ---
+
+
+# ... existing DB config ...
+
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
+app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
+app.config['MAIL_PORT'] = 25
+app.config['MAIL_USE_TLS'] = False 
+app.config['MAIL_DEFAULT_SENDER'] = 'administration.STS@avocarbon.com'
+
+# Initialize Mail
+mail = Mail(app)
 # Use your actual DATABASE_URL as an environment variable for better security!
 DATABASE_URL = "postgresql://adminavo:%24%23fKcdXPg4%40ue8AW@avo-adb-001.postgres.database.azure.com:5432/EDI%20IA"
 
@@ -3223,7 +3241,9 @@ def run_edi_analysis(
     # Sheets (carry Line & WeeklyCapacity via detailed_report rows)
     green_sheet, red_sheet = [], []
     for r in detailed_report:
-        is_green = (r["Interval"] == "W-1 to W" and r.get("Coverage_OK") is True) or (r.get("Violation") is False)
+        # NEW LOGIC: If there is a Violation, it is ALWAYS Red.
+        # W-1 to W has a 0% tolerance, so any change will trigger a Violation.
+        is_green = (r.get("Violation") is False)
         if is_green:
             green_sheet.append(r)
         else:
@@ -3318,7 +3338,7 @@ def analyze_single_week(
     # sheets (Line & WeeklyCapacity ride along in detailed rows)
     green_sheet, red_sheet = [], []
     for r in detailed_report:
-        is_green = (r["Interval"] == "W-1 to W" and r.get("Coverage_OK") is True) or (r.get("Violation") is False)
+        is_green = (r.get("Violation") is False)
         if is_green:
             green_sheet.append(r)
         else:
@@ -3536,8 +3556,792 @@ def product_capacity_stock():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------
+# >>> DECISION MATRIX & REPORTING LOGIC (DETERMINISTIC + AI WORDING ONLY) <<<
+# ---------------------------------------------------------
+# What this does:
+# - Python computes an exact Case_ID per red row (deterministic decision).
+# - A fixed DECISION_MAP defines "Who_Pays / What_To_Do / Next_Action" per case.
+# - ChatGPT is used ONLY to rewrite the deterministic fields into a clean client-facing Decision_Detail.
+# - Decisions are applied ONLY to red_sheet. Green stays raw (no decisions).
+# - No decision is added for rows that don't need it (Case_ID is None).
+#
+# SECURITY:
+# - Uses OPENAI_API_KEY from environment variables only (no hardcoded keys).
+
+
+
+
+# ========================= PRIMITIVES / AI ROW HELPERS =========================
+
+def build_ai_row(i, row):
+    """Doc/PPT-aligned primitives. Optional; used if you want richer case logic."""
+    G = (row.get("Difference", 0) or 0)
+    absG = abs(G)
+
+    # Stock
+    available_stock = row.get("Available_Stock", 0) or 0
+    safety_stock = row.get("Safety_Stock", 0) or 0
+    safety_protect = bool(row.get("Safety_Protect", True))
+    fg_free = max(available_stock - (safety_stock if safety_protect else 0), 0)
+    stock_cover = fg_free >= absG
+
+    # Capacity
+    line_capacity = row.get("Line_Capacity", row.get("WeeklyCapacity", 0)) or 0
+    planned_qty = row.get("Planned_Qty_on_Line", 0) or 0
+    normal_free_cap = max(line_capacity - planned_qty, 0)
+    cap_norm_cover = normal_free_cap >= absG
+
+    ot_ok = bool(row.get("OT_OK", False))
+    ot_capacity = row.get("OT_Capacity", 0) or 0
+    ot_cap_cover = ot_ok and (ot_capacity >= absG)
+
+    alt_site_ok = bool(row.get("Alt_Site_OK", False))
+    alt_cap = row.get("AltCap", 0) or 0
+    subc_ok = bool(row.get("SubC_OK", False))
+    subc_cap = row.get("SubCCap", 0) or 0
+    alt_or_subc_cover = (alt_site_ok and alt_cap >= absG) or (subc_ok and subc_cap >= absG)
+
+    # Material & logistics
+    material_ok = bool(row.get("Material_OK", False))
+    logi_ok = bool(row.get("Logi_OK", False))
+    air_ok = bool(row.get("Air_OK", False))
+
+    # Commercial
+    out_of_protocol = bool(row.get("OutOfProtocol", row.get("Violation", False)))
+
+    interval = row.get("Interval")
+    critical = (interval == "W-1 to W") and (not stock_cover)
+
+    return {
+        "id": i,
+        "Reference": row.get("AVOMaterialNo"),
+        "Interval": interval,
+        "G": G,
+        "AbsG": absG,
+        "INC": G > 0,
+        "DEC": G < 0,
+        "OutOfProtocol": out_of_protocol,
+        "FG_Free": fg_free,
+        "StockCover": stock_cover,
+        "Normal_Free_Cap": normal_free_cap,
+        "CapNormCover": cap_norm_cover,
+        "OTCapCover": ot_cap_cover,
+        "AltOrSubCCover": alt_or_subc_cover,
+        "Material_OK": material_ok,
+        "Logi_OK": logi_ok,
+        "Air_OK": air_ok,
+        "CRITICAL": critical,
+        "WIP_Risk": bool(row.get("WIP_Risk", False)),
+        "Swap_OK": bool(row.get("Swap_OK", False)),
+        "PO_Cancelable": bool(row.get("PO_Cancelable", False)),
+        "RS_OK": bool(row.get("RS_OK", False)),
+        "Storage_OK": bool(row.get("Storage_OK", False)),
+        "Realloc_OK": bool(row.get("Realloc_OK", False)),
+    }
+
+def choose_decrease_mitigation(row):
+    """
+    Pick EXACTLY ONE mitigation lever for DEC cases, in priority order.
+    Adjust the priority order to match your policy.
+    """
+    if bool(row.get("PO_Cancelable", False)):
+        return ("CancelPO", "Cancel open purchase orders where feasible to stop additional exposure.")
+    if bool(row.get("Realloc_OK", False)):
+        return ("Realloc", "Reallocate surplus to other demand where feasible to reduce liability.")
+    if bool(row.get("Storage_OK", False)):
+        return ("Storage", "Store surplus under agreed storage terms to contain liability.")
+    if bool(row.get("RS_OK", False)):
+        return ("Replan", "Replan production to avoid additional WIP build-up.")
+    # If nothing is feasible, the ONE action is escalation (not a menu)
+    return ("Escalate", "No mitigation lever is feasible—escalate for a containment plan and freeze further build.")
+
+
+
+# ========================= CASE ENGINE (DETERMINISTIC) =========================
+
+def compute_case_id(r):
+    """
+    Deterministic classification for Red Sheet rows.
+    Returns Case_ID or None (no decision needed).
+    """
+    G = (r.get("Difference", 0) or 0)
+    if G == 0:
+        return None
+
+    INC = G > 0
+    DEC = G < 0
+
+    oop = bool(r.get("OutOfProtocol", r.get("Violation", False)))
+    interval = r.get("Interval")
+
+    stock_cover = bool(r.get("StockCover", r.get("Coverage_OK", False)))
+    cap_norm_cover = bool(r.get("CapNormCover", False))
+    ot_cover = bool(r.get("OTCapCover", False))
+    alt_subc_cover = bool(r.get("AltOrSubCCover", False))
+
+    material_ok = bool(r.get("Material_OK", False))
+    logi_ok = bool(r.get("Logi_OK", False))
+    air_ok = bool(r.get("Air_OK", False))
+
+    wip_risk = bool(r.get("WIP_Risk", False))
+    swap_ok = bool(r.get("Swap_OK", False))
+
+    # CRITICAL increase: W-1 to W + no stock
+    if INC and interval == "W-1 to W" and not stock_cover:
+        return "INC_CRITICAL_AIR" if air_ok else "INC_CRITICAL_EXPEDITE"
+
+    if INC:
+        if stock_cover:
+            return "INC_OOP_STOCK" if oop else "INC_IP_STOCK"
+        if cap_norm_cover and material_ok and logi_ok:
+            return "INC_OOP_NORMCAP" if oop else "INC_IP_NORMCAP"
+        if ot_cover and material_ok and (logi_ok or air_ok):
+            return "INC_OOP_OT" if oop else "INC_IP_OT"
+        if alt_subc_cover and material_ok and (logi_ok or air_ok):
+            return "INC_OOP_ALT_SUBC" if oop else "INC_IP_ALT_SUBC"
+        if swap_ok:
+            return "INC_SWAP_PARTIAL"
+        return "INC_MANUAL"
+
+    if DEC:
+        if oop:
+            return "DEC_OOP"
+        if wip_risk:
+            return "DEC_WIP_RISK"
+        return "DEC_IP"
+
+    return None
+
+DECISION_MAP = {
+    # -------- INCREASE: Inside protocol (Supplier pays) --------
+    "INC_IP_STOCK": {
+        "Who_Pays": "Supplier",
+        "Lever": "Stock",
+        "What_To_Do": "Ship the additional quantity from available finished-goods stock (do not consume safety stock).",
+        "Next_Action": "Planner confirms FG availability; Warehouse executes shipment; Customer Service confirms ship date."
+    },
+    "INC_IP_NORMCAP": {
+        "Who_Pays": "Supplier",
+        "Lever": "NormalCap",
+        "What_To_Do": "Produce the additional quantity within normal capacity (standard hours).",
+        "Next_Action": "Planner adds to schedule; Procurement confirms material release; Logistics books standard transport."
+    },
+    "INC_IP_OT": {
+        "Who_Pays": "Supplier",
+        "Lever": "OT",
+        "What_To_Do": "Cover the increase using overtime capacity (supplier absorbs incremental cost).",
+        "Next_Action": "Ops approves OT plan; Planner schedules OT lot; Logistics confirms transport mode."
+    },
+    "INC_IP_ALT_SUBC": {
+        "Who_Pays": "Supplier",
+        "Lever": "AltLine/SubC",
+        "What_To_Do": "Cover the increase via alternate line or subcontracting (supplier absorbs incremental cost).",
+        "Next_Action": "Industrial validates routing; Procurement places subcontract PO; Planner allocates loads; Logistics confirms transport."
+    },
+
+    # -------- INCREASE: Out of protocol (Client pays) --------
+    "INC_OOP_STOCK": {
+        "Who_Pays": "Client",
+        "Lever": "Stock",
+        "What_To_Do": "Ship from finished-goods stock with off-protocol surcharge.",
+        "Next_Action": "Finance applies surcharge; Planner confirms stock; Customer Service obtains approval and confirms ship date."
+    },
+    "INC_OOP_NORMCAP": {
+        "Who_Pays": "Client",
+        "Lever": "NormalCap",
+        "What_To_Do": "Produce in standard hours and apply off-protocol surcharge.",
+        "Next_Action": "Planner schedules production; Finance issues quotation; Customer Service obtains approval and confirms commit date."
+    },
+    "INC_OOP_OT": {
+        "Who_Pays": "Client",
+        "Lever": "OT",
+        "What_To_Do": "Cover the increase using overtime; charge OT premium plus off-protocol surcharge.",
+        "Next_Action": "Ops confirms feasibility; Finance issues OT premium quotation; Customer Service obtains approval; Planner schedules OT."
+    },
+    "INC_OOP_ALT_SUBC": {
+        "Who_Pays": "Client",
+        "Lever": "AltLine/SubC",
+        "What_To_Do": "Cover the increase via alternate line/subcontracting; charge incremental uplift plus off-protocol surcharge.",
+        "Next_Action": "Procurement aligns subcontracting; Finance issues quotation; Customer Service obtains approval; Planner allocates loads."
+    },
+
+    # -------- INCREASE: CRITICAL (payer is dynamic based on protocol) --------
+    "INC_CRITICAL_AIR": {
+        "Who_Pays": "DYNAMIC",
+        "Lever": "Air",
+        "What_To_Do": "CRITICAL: Expedite production and ship by air to avoid immediate stockout.",
+        "Next_Action": "Planner escalates immediately; Logistics books air; Customer Service confirms emergency commit and obtains approval if off-protocol."
+    },
+    "INC_CRITICAL_EXPEDITE": {
+        "Who_Pays": "DYNAMIC",
+        "Lever": "ExpediteSupplier",
+        "What_To_Do": "CRITICAL: Expedite production/materials immediately to avoid stockout (air not available).",
+        "Next_Action": "Planner escalates; Procurement expedites suppliers; Ops prioritizes line; Customer Service confirms commit and obtains approval if off-protocol."
+    },
+
+    # -------- DECREASE: Inside protocol --------
+    "DEC_IP": {
+        "Who_Pays": "Supplier",
+        "Lever": "Replan",
+        "What_To_Do": "Decrease within protocol: replan the surplus to avoid unnecessary production.",
+        "Next_Action": "Planner updates plan and releases/holds production orders accordingly."
+    },
+
+    # DEC_OOP / DEC_WIP_RISK are computed dynamically (one lever picked),
+    # so they are not fully defined here.
+    "INC_SWAP_PARTIAL": {
+        "Who_Pays": "Manual",
+        "Lever": "Swap",
+        "What_To_Do": "Validate SWAP feasibility to cover the increase before committing.",
+        "Next_Action": "Planner/Sales identify swap candidate and confirm feasibility; then update plan and commit date."
+    },
+}
+
+
+def apply_matrix_decisions_red_only(analysis_result):
+    """
+    Applies deterministic, precise decisions ONLY to Red sheet rows.
+    Adds:
+      - Case_ID
+      - Who_Pays
+      - Lever (single)
+      - What_To_Do
+      - Next_Action
+      - Decision_Summary (concise)
+      - Decision_Source
+    Leaves rows with no case_id untouched (no decision).
+    """
+    red = analysis_result.get("red_sheet") or []
+
+    for row in red:
+        case_id = compute_case_id(row)
+        if not case_id:
+            continue
+
+        oop = bool(row.get("OutOfProtocol", row.get("Violation", False)))
+
+        if case_id in ("DEC_OOP", "DEC_WIP_RISK"):
+            lever, lever_text = choose_decrease_mitigation(row)
+            who_pays = "Client" if case_id == "DEC_OOP" else ("Client" if oop else "Manual")
+            row["Case_ID"] = case_id
+            row["Who_Pays"] = who_pays
+            row["Lever"] = lever
+            row["What_To_Do"] = (
+                "Decrease is out of protocol: charge liability and apply mitigation. " + lever_text
+                if case_id == "DEC_OOP"
+                else "Decrease triggers WIP risk: apply mitigation. " + lever_text
+            )
+            row["Next_Action"] = (
+                "Planner quantifies exposure; Finance computes charges; Customer Service issues formal acknowledgement."
+                if case_id == "DEC_OOP"
+                else "Supply Chain lead reviews exposure and approves mitigation; Planner executes; Finance/CS align commercial handling."
+            )
+            row["Decision_Summary"] = row["What_To_Do"]
+            row["Decision_Source"] = "Matrix"
+            continue
+
+        if case_id == "INC_MANUAL":
+            blockers = list_increase_blockers(row)
+            row["Case_ID"] = case_id
+            row["Who_Pays"] = "Manual"
+            row["Lever"] = "Escalate"
+            row["What_To_Do"] = (
+                "Increase cannot be met with available levers; escalate to renegotiate commit date."
+                + (f" Blockers: {', '.join(blockers)}." if blockers else "")
+            )
+            row["Next_Action"] = "Supply Chain lead proposes revised commit/partial acceptance; Customer Service communicates decision to client."
+            row["Decision_Summary"] = row["What_To_Do"]
+            row["Decision_Source"] = "Matrix"
+            continue
+
+        templ = DECISION_MAP.get(case_id)
+        if not templ:
+            continue
+
+        # Dynamic payer for critical cases
+        if templ.get("Who_Pays") == "DYNAMIC":
+            who_pays = "Client" if oop else "Supplier"
+        else:
+            who_pays = templ["Who_Pays"]
+
+        row["Case_ID"] = case_id
+        row["Who_Pays"] = who_pays
+        row["Lever"] = templ.get("Lever")
+        row["What_To_Do"] = templ.get("What_To_Do")
+        row["Next_Action"] = templ.get("Next_Action")
+        row["Decision_Summary"] = templ.get("What_To_Do")
+        row["Decision_Source"] = "Matrix"
+
+    return analysis_result
+
+
+
+def list_increase_blockers(row):
+    """
+    Extract precise blockers for INC_MANUAL decisions.
+    Uses doc/PPT primitives if present; falls back to legacy fields.
+    """
+    blockers = []
+
+    stock_cover = bool(row.get("StockCover", row.get("Coverage_OK", False)))
+    cap_norm_cover = bool(row.get("CapNormCover", False))
+    ot_cover = bool(row.get("OTCapCover", False))
+    alt_subc_cover = bool(row.get("AltOrSubCCover", False))
+    material_ok = bool(row.get("Material_OK", False))
+    logi_ok = bool(row.get("Logi_OK", False))
+    air_ok = bool(row.get("Air_OK", False))
+
+    if not stock_cover:
+        blockers.append("no FG stock cover")
+    if not cap_norm_cover:
+        blockers.append("no normal capacity")
+    if not ot_cover:
+        blockers.append("no overtime capacity")
+    if not alt_subc_cover:
+        blockers.append("no alternate/subcontract capacity")
+    if not material_ok:
+        blockers.append("materials not ready")
+    if not (logi_ok or air_ok):
+        blockers.append("logistics not feasible (standard/air)")
+
+    return blockers
+
+
+
+# ========================= OPENAI CLIENT (ENV ONLY) =========================
+
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+def _safe_json_loads(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not m:
+            raise
+        return json.loads(m.group(0))
+
+
+# ========================= AI WORDING ONLY =========================
+
+def rewrite_decisions_with_ai_one_sentence(red_sheet_rows):
+    """
+    AI is used ONLY to rewrite the already-determined matrix decision into ONE precise client-facing sentence.
+    Must NOT add options, must NOT propose multiple levers.
+    Returns JSON: { "row_index": "Decision_Detail sentence" }
+    """
+    if not red_sheet_rows:
+        return red_sheet_rows
+    if not client:
+        logging.warning("OpenAI client not configured; skipping AI wording rewrite.")
+        return red_sheet_rows
+
+    payload = []
+    idxs = []
+
+    for i, row in enumerate(red_sheet_rows):
+        if not row.get("Case_ID"):
+            continue
+        payload.append({
+            "id": i,
+            "Reference": row.get("AVOMaterialNo"),
+            "Case_ID": row.get("Case_ID"),
+            "Interval": row.get("Interval"),
+            "Difference": row.get("Difference"),
+            "Who_Pays": row.get("Who_Pays"),
+            "Lever": row.get("Lever"),
+            "What_To_Do": row.get("What_To_Do"),
+            "Next_Action": row.get("Next_Action"),
+        })
+        idxs.append(i)
+
+    if not payload:
+        return red_sheet_rows
+
+    system_prompt = (
+        "You are rewriting decisions for an EDI exception report.\n"
+        "STRICT RULES:\n"
+        "- Output EXACTLY ONE sentence per row.\n"
+        "- Do NOT use bullet points.\n"
+        "- Do NOT include alternatives, options, menus, or 'or'.\n"
+        "- Do NOT change Who_Pays, Lever, What_To_Do, Next_Action, or Case_ID.\n"
+        "- Your sentence must include: payer + lever + action + next action owner.\n"
+        "- If Case_ID starts with 'INC_CRITICAL', the sentence must start with 'CRITICAL:'.\n\n"
+        "Return strictly valid JSON mapping id -> sentence:\n"
+        '{ "0": "sentence", "5": "sentence" }\n'
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            temperature=0.0,  # maximize determinism
+        )
+
+        content = (resp.choices[0].message.content or "").strip()
+        rewritten = _safe_json_loads(content)
+
+        for i in idxs:
+            sent = rewritten.get(str(i)) or rewritten.get(i)
+            if isinstance(sent, str) and sent.strip():
+                red_sheet_rows[i]["Decision_Detail"] = sent.strip()
+                red_sheet_rows[i]["Decision_Source"] = "Matrix+AI"
+
+    except Exception as e:
+        logging.error(f"AI rewrite failed: {e}")
+
+    return red_sheet_rows
+
+# ========================= FALLBACK (NO AI) =========================
+
+def apply_fallback_if_missing_details(analysis_result):
+    """
+    Ensures Decision_Detail exists for rows with decisions, even if AI rewrite fails.
+    """
+    red = analysis_result.get("red_sheet") or []
+    for row in red:
+        if not row.get("Case_ID"):
+            continue
+        if row.get("Decision_Detail"):
+            continue
+
+        # Deterministic minimal detail
+        who = row.get("Who_Pays", "Manual")
+        row["Decision_Detail"] = (
+            f"Case: {row.get('Case_ID')}"
+            f" | Payer: {who}"
+            f" | Action: {row.get('What_To_Do')}"
+            f" | Next: {row.get('Next_Action')}"
+        )
+        row["Decision_Source"] = row.get("Decision_Source", "Matrix")
+
+    return analysis_result
+
+
+# ========================= REPORTING HELPERS =========================
+
+def generate_excel_bytes(analysis_result):
+    output = io.BytesIO()
+
+    # 1. Define the Strict Column Mapping (Internal Key -> Excel Header)
+    # Ensure these keys (Left side) exist in your data dictionaries (edi_rows/analysis result)
+    # If your internal keys are named differently (e.g., 'Old_Qty' vs 'Qty_W1'), update the Left side.
+    red_columns_map = {
+    "Site": "Site",
+    "Weeks": "Week Comparison",
+    "ClientCode": "ClientCode",
+    "AVOMaterialNo": "AVOMaterialNo",
+    "Interval": "Interval",
+    "Quantity_W1": "Quantity W1",
+    "Quantity_W2": "Quantity W2",
+    "Difference": "Difference",
+    "Variation": "Variation %",
+    "Threshold": "Allowed %",
+    "Violation": "Violation",
+    "InTransit": "InStock",
+    "Line": "Line",
+    "WeeklyCapacity": "Weekly Capacity",
+
+    # final decision column
+    "Decision": "Decision",
+}
+
+
+    # 2. Define Green Sheet Mapping (Subset of Red, excluding decision columns)
+    # We remove the columns that don't apply to "OK" lines
+    exclude_green = ["What_To_Do", "Next_Action", "Decision_Summary", "Violation"]
+    green_columns_map = {k: v for k, v in red_columns_map.items() if k not in exclude_green}
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        
+        # --- RED SHEET (Action Required) ---
+        if analysis_result.get("red_sheet"):
+            df_red = pd.DataFrame(analysis_result["red_sheet"])
+            
+            # Filter and Reorder columns based on the map
+            # We use .get to avoid crashes if a key is missing (fills with NaN)
+            final_red = pd.DataFrame()
+            for key, header in red_columns_map.items():
+                if key in df_red.columns:
+                    final_red[header] = df_red[key]
+                else:
+                    final_red[header] = None # Create empty column if missing
+
+            final_red.to_excel(writer, sheet_name="Red Sheet (Action)", index=False)
+            
+            # Optional: Auto-adjust column widths (Visual Polish)
+            worksheet = writer.sheets["Red Sheet (Action)"]
+            for i, col in enumerate(final_red.columns):
+                max_len = max(
+                    final_red[col].astype(str).map(len).max(),
+                    len(col)
+                ) + 2
+                worksheet.set_column(i, i, max_len)
+
+        # --- GREEN SHEET (OK) ---
+        if analysis_result.get("green_sheet"):
+            df_green = pd.DataFrame(analysis_result["green_sheet"])
+            
+            final_green = pd.DataFrame()
+            for key, header in green_columns_map.items():
+                if key in df_green.columns:
+                    final_green[header] = df_green[key]
+                else:
+                    final_green[header] = None
+
+            final_green.to_excel(writer, sheet_name="Green Sheet (OK)", index=False)
+            
+            # Optional: Auto-adjust column widths
+            worksheet = writer.sheets["Green Sheet (OK)"]
+            for i, col in enumerate(final_green.columns):
+                max_len = max(
+                    final_green[col].astype(str).map(len).max(),
+                    len(col)
+                ) + 2
+                worksheet.set_column(i, i, max_len)
+
+        # --- SUMMARY SHEET (Optional, usually good to keep) ---
+        if analysis_result.get("summary_per_group"):
+            df_sum = pd.DataFrame(analysis_result["summary_per_group"])
+            df_sum.to_excel(writer, sheet_name="Summary", index=False)
+
+    return output.getvalue()
+
+def compute_reporting_fields(result, weeks):
+    all_rows = (result.get("red_sheet") or []) + (result.get("green_sheet") or [])
+    week_str = f"{weeks[0]} vs {weeks[-1]}" if len(weeks) > 1 else str(weeks[0])
+
+    for row in all_rows:
+        row["Weeks"] = week_str
+
+        # 1. Quantities
+        q1 = row.get("Quantity_W1") if row.get("Quantity_W1") is not None else row.get("Old_Qty")
+        q2 = row.get("Quantity_W2") if row.get("Quantity_W2") is not None else row.get("New_Qty")
+        row["Quantity_W1"] = q1
+        row["Quantity_W2"] = q2
+
+        # 2. Variation
+        try:
+            q1f = float(q1) if q1 else 0.0
+            q2f = float(q2) if q2 else 0.0
+            row["Variation"] = round(((q2f - q1f) / q1f) * 100.0, 2) if q1f != 0 else (100.0 if q2f > 0 else 0.0)
+        except:
+            row["Variation"] = 0.0
+
+        # 3. FIXED: Allowed % (Threshold) logic
+        # This checks for the first key that actually HAS a value (including 0)
+        threshold_keys = [
+            "Threshold", "Allowed_Change_%", "AllowedChangePct", "Allowed_Variation", 
+            "Tolerance", "Allowed", "Protocol_Threshold"
+        ]
+        
+        final_thr = None
+        for k in threshold_keys:
+            val = row.get(k)
+            if val is not None:
+                final_thr = val
+                break
+        
+        row["Threshold"] = final_thr
+
+        # 4. Stock & Capacity
+        row["Available_Stock"] = row.get("Available_Stock") if row.get("Available_Stock") is not None else row.get("InStock")
+        row["WeeklyCapacity"] = row.get("WeeklyCapacity") if row.get("WeeklyCapacity") is not None else row.get("Line_Capacity")
+
+    return result
+
+# ========================= ENDPOINT =========================
+# Assumes these exist:
+# _extract_body, _coerce_list, fetch_ediglobal, fetch_deliverydetails,
+# fetch_productdetails_map, analyze_single_week, run_edi_analysis, mail
+def ensure_decision_detail_exists(red_sheet_rows):
+    """
+    If AI fails, generate a deterministic one-sentence Decision_Detail.
+    """
+    for row in red_sheet_rows or []:
+        if not row.get("Case_ID"):
+            continue
+        if row.get("Decision_Detail"):
+            continue
+
+        payer = row.get("Who_Pays", "Manual")
+        lever = row.get("Lever", "Escalate")
+        # deterministic single-sentence fallback (no menus)
+        row["Decision_Detail"] = (
+            f"{row.get('Decision_Summary')} (Payer: {payer}; Lever: {lever}; Next: {row.get('Next_Action')})."
+        )
+    return red_sheet_rows
+
+
+def finalize_decision_column_for_excel(analysis_result):
+    """
+    Creates a single final 'Decision' column for Red sheet only,
+    combining the precise decision parts into one string.
+    Only sets Decision if Case_ID exists (i.e., row needs action).
+    """
+    red = analysis_result.get("red_sheet") or []
+    for row in red:
+        if not row.get("Case_ID"):
+            # No decision needed for this row
+            row.pop("Decision", None)
+            continue
+
+        what = (row.get("What_To_Do") or row.get("Decision_Summary") or "").strip()
+        payer = (row.get("Who_Pays") or "").strip()
+        nxt = (row.get("Next_Action") or "").strip()
+
+        parts = []
+        if what:
+            parts.append(what)
+        if payer:
+            parts.append(f"Payer: {payer}")
+        if nxt:
+            parts.append(f"Next: {nxt}")
+
+        row["Decision"] = " | ".join(parts)
+
+    return analysis_result
+
+
+
+@app.route("/send-report", methods=["POST"])
+def send_report_endpoint():
+    try:
+        body = _extract_body()
+
+        # 1) Extract Parameters
+        weeks = _coerce_list(body.get("forecastWeeks") or body.get("ediWeekNumbers"))
+        client_codes = _coerce_list(body.get("clientCodes") or body.get("ClientCode"))
+        product_codes = _coerce_list(body.get("productCodes") or body.get("ProductCode") or body.get("AVOMaterialNo"))
+        sites = _coerce_list(body.get("sites") or body.get("Site"))
+        recipient_email = body.get("email_recipient")
+        use_ai = body.get("use_ai", True)
+
+        if not recipient_email or not weeks:
+            return jsonify({
+                "status": "error",
+                "message": "email_recipient and forecastWeeks are required"
+            }), 400
+
+        # 2) Run Core Analysis
+        edi_rows = fetch_ediglobal(weeks, client_codes, product_codes, sites)
+        delivery_rows = fetch_deliverydetails(weeks, product_codes, sites)
+
+        prods_for_meta = product_codes or sorted({
+            str(r.get("AVOMaterialNo") or "").strip()
+            for r in edi_rows
+            if r.get("AVOMaterialNo")
+        })
+        product_info = fetch_productdetails_map(prods_for_meta)
+
+        result = (
+            analyze_single_week(edi_rows, delivery_rows, product_info)
+            if len(weeks) == 1
+            else run_edi_analysis(edi_rows, delivery_rows, product_info)
+        )
+
+        # 3) Enrich RED rows
+        red_rows = result.get("red_sheet") or []
+        for i, r in enumerate(red_rows):
+            prim = build_ai_row(i, r)
+            for k, v in prim.items():
+                r.setdefault(k, v)
+
+        # 4) Deterministic Decisions
+        result = apply_matrix_decisions_red_only(result)
+
+        # 5) AI Rewrite
+        if use_ai and client and result.get("red_sheet"):
+            result["red_sheet"] = rewrite_decisions_with_ai_one_sentence(result["red_sheet"])
+
+        # 6) Ensure Decision Details
+        if result.get("red_sheet"):
+            result["red_sheet"] = ensure_decision_detail_exists(result["red_sheet"])
+
+        result = finalize_decision_column_for_excel(result)
+
+
+        
+
+        result = compute_reporting_fields(result, weeks)
+
+
+        # 7) Generate Excel
+        excel_bytes = generate_excel_bytes(result)
+
+        # 8) Send Email
+        subject_weeks = f"{weeks[0]}" if len(weeks) == 1 else f"{weeks[0]} vs {weeks[-1]}"
+        filename = f"EDI_Report_{subject_weeks}.xlsx"
+        
+        red_count = len(result.get("red_sheet") or [])
+        green_count = len(result.get("green_sheet") or [])
+        
+        html_body = f"""
+        <html>
+            <body style="font-family: 'Segoe UI', Arial, sans-serif; color: #333333; line-height: 1.6;">
+                <div style="max-width: 600px; margin: 0 auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
+                    <div style="background-color: #0056b3; color: #ffffff; padding: 20px; text-align: center;">
+                        <h2 style="margin: 0;">EDI Analysis Report</h2>
+                        <p style="margin: 5px 0 0; font-size: 14px;">Week(s): {subject_weeks}</p>
+                    </div>
+                    <div style="padding: 20px;">
+                        <p>Hello,</p>
+                        <p>Please find attached the latest EDI Analysis Report.</p>
+                        
+                        <div style="background-color: #f8f9fa; border-left: 4px solid #0056b3; padding: 15px; margin: 20px 0;">
+                            <h3 style="margin-top: 0; font-size: 16px; color: #0056b3;">Executive Summary</h3>
+                            <ul style="padding-left: 20px; margin-bottom: 0;">
+                                <li style="margin-bottom: 8px;">
+                                    <strong style="color: #d9534f;">Red Sheet (Action Required):</strong> {red_count} lines
+                                </li>
+                                <li>
+                                    <strong style="color: #28a745;">Green Sheet (OK):</strong> {green_count} lines
+                                </li>
+                            </ul>
+                        </div>
+                        <p><strong>Next Steps:</strong> Review the attached Red Sheet for actions.</p>
+                    </div>
+                    <div style="background-color: #f1f1f1; color: #888; padding: 15px; text-align: center; font-size: 12px;">
+                        <p style="margin: 0;">Generated automatically by STS Administration AI</p>
+                    </div>
+                </div>
+            </body>
+        </html>
+        """
+
+        msg = Message(
+            subject=f"EDI Report ({subject_weeks}) - {red_count} Exceptions",
+            recipients=[recipient_email],
+            cc=["edi.tunisia@avocarbon.com"],
+            html=html_body
+        )
+
+        msg.attach(
+            filename,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            excel_bytes
+        )
+
+        mail.send(msg)
+
+        return jsonify({
+            "status": "success",
+            "message": f"Report sent to {recipient_email}",
+            "filename": filename
+        }), 200
+
+    except Exception as e:
+        logging.exception("Error in /send-report")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 
