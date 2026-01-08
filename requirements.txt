@@ -13,3 +13,4 @@ openpyxl
 xlsxwriter
 python-dotenv
 SQLAlchemy
+apscheduler
