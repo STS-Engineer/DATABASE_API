@@ -9,7 +9,7 @@ import psycopg2
 import pdfplumber
 import PyPDF2
 from psycopg2 import errors
-from datetime import datetime, date
+from datetime import datetime ,date
 import re
 from collections import defaultdict , Counter
 import os
@@ -21,7 +21,8 @@ import pandas as pd
 import requests
 from flask_mail import Mail, Message
 import openai
-# ... existing imports ...
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -4116,12 +4117,22 @@ def generate_excel_bytes(analysis_result):
 
     return output.getvalue()
 
+
 def compute_reporting_fields(result, weeks):
     all_rows = (result.get("red_sheet") or []) + (result.get("green_sheet") or [])
-    week_str = f"{weeks[0]} vs {weeks[-1]}" if len(weeks) > 1 else str(weeks[0])
+    
+    # This is the global fallback (e.g. W1 vs W4)
+    global_week_str = f"{weeks[0]} vs {weeks[-1]}" if len(weeks) > 1 else str(weeks[0])
 
     for row in all_rows:
-        row["Weeks"] = week_str
+        # FIX: Check if the row already has a specific pair-wise comparison
+        # In run_edi_analysis, we set "Week_Comparison" as "2025-W01_vs_2025-W02"
+        if row.get("Week_Comparison"):
+            # Clean up the underscore if desired, or keep it as is
+            row["Weeks"] = row["Week_Comparison"].replace("_vs_", " vs ")
+        else:
+            # Fallback to the global range if specific data is missing
+            row["Weeks"] = global_week_str
 
         # 1. Quantities
         q1 = row.get("Quantity_W1") if row.get("Quantity_W1") is not None else row.get("Old_Qty")
@@ -4138,7 +4149,6 @@ def compute_reporting_fields(result, weeks):
             row["Variation"] = 0.0
 
         # 3. FIXED: Allowed % (Threshold) logic
-        # This checks for the first key that actually HAS a value (including 0)
         threshold_keys = [
             "Threshold", "Allowed_Change_%", "AllowedChangePct", "Allowed_Variation", 
             "Tolerance", "Allowed", "Protocol_Threshold"
@@ -4158,6 +4168,8 @@ def compute_reporting_fields(result, weeks):
         row["WeeklyCapacity"] = row.get("WeeklyCapacity") if row.get("WeeklyCapacity") is not None else row.get("Line_Capacity")
 
     return result
+
+
 
 # ========================= ENDPOINT =========================
 # Assumes these exist:
@@ -4215,22 +4227,92 @@ def finalize_decision_column_for_excel(analysis_result):
 
 @app.route("/send-report", methods=["POST"])
 def send_report_endpoint():
-    try:
-        body = _extract_body()
+    # 1. Route extracts data from the HTTP request
+    body = _extract_body() 
+    
+    # 2. Passes that data to the logic function
+    response_data, status_code = trigger_report_logic(body)
+    
+    # 3. Returns a JSON response to the caller (Browser/Postman/System)
+    return jsonify(response_data), status_code
 
-        # 1) Extract Parameters
-        weeks = _coerce_list(body.get("forecastWeeks") or body.get("ediWeekNumbers"))
-        client_codes = _coerce_list(body.get("clientCodes") or body.get("ClientCode"))
-        product_codes = _coerce_list(body.get("productCodes") or body.get("ProductCode") or body.get("AVOMaterialNo"))
-        sites = _coerce_list(body.get("sites") or body.get("Site"))
-        recipient_email = body.get("email_recipient")
-        use_ai = body.get("use_ai", True)
+
+# --- Configuration: Mapping Owners to Client Codes ---
+# In a real scenario, fetch this from a DB table like "UserClients"
+CLIENT_OWNERS = {
+    "mohamedlaith.benmabrouk@avocarbon.com": ["C00409", "C00250", "C00132"], # Valeo Nevers, Poland, etc.
+    "chaima.benyahia@avocarbon.com": ["C00260", "C00113", "C00126", "C00409"], # Nidec sites
+    "edi.tunisia@avocarbon.com": None # None means "All Clients"
+}
+
+def get_consecutive_weeks():
+    """Returns [W-1, W] based on current date."""
+    today = datetime.now()
+    # Current week
+    iso_year, iso_week, _ = today.isocalendar()
+    current_w = f"{iso_year}-W{iso_week:02d}"
+    
+    # Previous week
+    last_week_date = today - timedelta(days=7)
+    lyear, lweek, _ = last_week_date.isocalendar()
+    prev_w = f"{lyear}-W{lweek:02d}"
+    
+    return [prev_w, current_w]
+
+
+
+
+
+def get_past_weeks(offset_earlier, offset_later):
+    """
+    Returns a list of two ISO weeks relative to today.
+    Example: get_past_weeks(4, 3) returns [W-4, W-3]
+    """
+    today = datetime.now()
+    
+    # Calculate the earlier week (e.g., 4 weeks ago)
+    date_earlier = today - timedelta(weeks=offset_earlier)
+    year_e, week_e, _ = date_earlier.isocalendar()
+    iso_earlier = f"{year_e}-W{week_e:02d}"
+    
+    # Calculate the later week (e.g., 3 weeks ago)
+    date_later = today - timedelta(weeks=offset_later)
+    year_l, week_l, _ = date_later.isocalendar()
+    iso_later = f"{year_l}-W{week_l:02d}"
+    
+    return [iso_earlier, iso_later]
+
+def scheduled_analysis_job():
+    with app.app_context():
+        weeks = get_past_weeks(1,0)
+        for email, client_list in CLIENT_OWNERS.items():
+            report_payload = {
+                "forecastWeeks": weeks,
+                "clientCodes": client_list,
+                "email_recipient": email,
+                "use_ai": True
+            }
+            # This NO LONGER touches the Flask 'request' object
+            trigger_report_logic(report_payload)
+
+
+
+# Helper to avoid code duplication between API and Scheduler
+def trigger_report_logic(data_dict):
+    """
+    Returns a tuple: (python_dict, status_code)
+    """
+    try:
+        # 1) Use the passed dictionary
+        weeks = _coerce_list(data_dict.get("forecastWeeks") or data_dict.get("ediWeekNumbers"))
+        client_codes = _coerce_list(data_dict.get("clientCodes") or data_dict.get("ClientCode"))
+        product_codes = _coerce_list(data_dict.get("productCodes") or data_dict.get("ProductCode") or data_dict.get("AVOMaterialNo"))
+        sites = _coerce_list(data_dict.get("sites") or data_dict.get("Site"))
+        recipient_email = data_dict.get("email_recipient")
+        use_ai = data_dict.get("use_ai", True)
 
         if not recipient_email or not weeks:
-            return jsonify({
-                "status": "error",
-                "message": "email_recipient and forecastWeeks are required"
-            }), 400
+            return {"status": "error", "message": "email_recipient and forecastWeeks are required"}, 400
 
         # 2) Run Core Analysis
         edi_rows = fetch_ediglobal(weeks, client_codes, product_codes, sites)
@@ -4238,16 +4320,22 @@ def send_report_endpoint():
 
         prods_for_meta = product_codes or sorted({
             str(r.get("AVOMaterialNo") or "").strip()
-            for r in edi_rows
-            if r.get("AVOMaterialNo")
+            for r in edi_rows if r.get("AVOMaterialNo")
         })
         product_info = fetch_productdetails_map(prods_for_meta)
 
-        result = (
-            analyze_single_week(edi_rows, delivery_rows, product_info)
-            if len(weeks) == 1
-            else run_edi_analysis(edi_rows, delivery_rows, product_info)
-        )
+        # Normalize weeks
+        for r in edi_rows:
+            r["ForecastDate"] = norm_week_str(r.get("ForecastDate"))
+
+        # Check actual data availability
+        found_data_weeks = sorted({r["ForecastDate"] for r in edi_rows if r.get("ForecastDate")})
+
+        if len(found_data_weeks) < 2:
+            logging.warning(f"Requested {len(weeks)} weeks but found data for {len(found_data_weeks)}. Fallback to single-week analysis.")
+            result = analyze_single_week(edi_rows, delivery_rows, product_info)
+        else:
+            result = run_edi_analysis(edi_rows, delivery_rows, product_info)
 
         # 3) Enrich RED rows
         red_rows = result.get("red_sheet") or []
@@ -4263,17 +4351,9 @@ def send_report_endpoint():
         if use_ai and client and result.get("red_sheet"):
             result["red_sheet"] = rewrite_decisions_with_ai_one_sentence(result["red_sheet"])
 
-        # 6) Ensure Decision Details
-        if result.get("red_sheet"):
-            result["red_sheet"] = ensure_decision_detail_exists(result["red_sheet"])
-
+        # 6) Finalize
         result = finalize_decision_column_for_excel(result)
-
-
-        
-
         result = compute_reporting_fields(result, weeks)
-
 
         # 7) Generate Excel
         excel_bytes = generate_excel_bytes(result)
@@ -4296,7 +4376,6 @@ def send_report_endpoint():
                     <div style="padding: 20px;">
                         <p>Hello,</p>
                         <p>Please find attached the latest EDI Analysis Report.</p>
-                        
                         <div style="background-color: #f8f9fa; border-left: 4px solid #0056b3; padding: 15px; margin: 20px 0;">
                             <h3 style="margin-top: 0; font-size: 16px; color: #0056b3;">Executive Summary</h3>
                             <ul style="padding-left: 20px; margin-bottom: 0;">
@@ -4308,10 +4387,6 @@ def send_report_endpoint():
                                 </li>
                             </ul>
                         </div>
-                        <p><strong>Next Steps:</strong> Review the attached Red Sheet for actions.</p>
-                    </div>
-                    <div style="background-color: #f1f1f1; color: #888; padding: 15px; text-align: center; font-size: 12px;">
-                        <p style="margin: 0;">Generated automatically by STS Administration AI</p>
                     </div>
                 </div>
             </body>
@@ -4333,18 +4408,18 @@ def send_report_endpoint():
 
         mail.send(msg)
 
-        return jsonify({
+        # Return a Python DICT, not a jsonify object
+        return {
             "status": "success",
             "message": f"Report sent to {recipient_email}",
             "filename": filename
-        }), 200
+        }, 200
 
     except Exception as e:
-        logging.exception("Error in /send-report")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-
+        logging.exception("Error in trigger_report_logic")
+        # Return a Python DICT for error too
+        return {"status": "error", "message": str(e)}, 500
+    
 # ========================= DATA RETRIEVAL APIS =========================
 
 @app.route("/get-delivery-details", methods=["POST"])
@@ -4444,8 +4519,21 @@ def get_product_details_route():
 
 
 
-
-
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5001,debug=True)
+    # ONLY start the scheduler if we are in the reloader process (the child process)
+    # This prevents the parent process from starting a duplicate scheduler.
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        scheduler = BackgroundScheduler()
+        
+        # Run Monday at 08:00 AM
+        scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='tue', hour=8, minute=0)
+        
+        # Run Friday at 04:00 PM
+        scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='fri', hour=14, minute=0)
+        
+        
+        scheduler.start()
+        logging.info("Scheduler started successfully (Reloader Process Only).") 
 
+    # Start Flask
+    app.run(host='0.0.0.0', port=5001, debug=True)
