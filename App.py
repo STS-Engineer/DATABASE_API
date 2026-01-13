@@ -25,7 +25,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import pytz
 
-app = Flask(__name__)
 
 # --- Flask-Mail Configuration (Outlook SMTP) ---
 
@@ -4753,48 +4752,92 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
 
 # ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
+# Place this BEFORE the "if __name__ == '__main__':" block
+
+# --- GLOBAL VARIABLES ---
+# We keep the connection object globally so the lock is not released by the garbage collector
+scheduler_db_conn = None 
+app_scheduler = None
 
 def init_scheduler():
-    # 1. Use a database connection to try and get an advisory lock
-    conn = get_pg_connection()
-    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-    cur = conn.cursor()
+    """
+    Initializes the BackgroundScheduler only on a single worker using 
+    a PostgreSQL Advisory Lock to prevent duplicate reports.
+    """
+    global scheduler_db_conn, app_scheduler
     
-    # We use a random ID (e.g., 999) to represent the "Scheduler Lock"
-    cur.execute("SELECT pg_try_advisory_lock(999);")
-    is_master_worker = cur.fetchone()[0]
+    try:
+        # 1. Establish a dedicated connection for the lock
+        scheduler_db_conn = get_pg_connection()
+        
+        # Advisory locks work best in autocommit mode
+        scheduler_db_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+        cur = scheduler_db_conn.cursor()
+        
+        # 2. Attempt to acquire a session-level advisory lock with ID 999
+        # This returns True if this specific worker is the first to grab it
+        cur.execute("SELECT pg_try_advisory_lock(999);")
+        is_master = cur.fetchone()[0]
 
-    if not is_master_worker:
-        # This worker didn't get the lock, it remains silent
+        if not is_master:
+            app.logger.info("Scheduler lock held by another worker. This worker will stay in standby.")
+            scheduler_db_conn.close()
+            scheduler_db_conn = None
+            return None
+
+        # 3. Only the 'Winner' worker reaches this point
+        tunisia_tz = pytz.timezone('Africa/Tunis')
+        scheduler = BackgroundScheduler(timezone=tunisia_tz)
+        
+        # --- JOB 1: Tuesday Analysis Report ---
+        scheduler.add_job(
+            func=scheduled_analysis_job,
+            trigger='cron', 
+            day_of_week='tue', 
+            hour=12, 
+            minute=35,
+            id='tuesday_analysis',
+            replace_existing=True
+        )
+        
+        # --- JOB 2: Friday Analysis Report ---
+        scheduler.add_job(
+            func=scheduled_analysis_job,
+            trigger='cron', 
+            day_of_week='fri', 
+            hour=14, 
+            minute=0,
+            id='friday_analysis',
+            replace_existing=True
+        )
+        
+        # --- JOB 3: Weekly EDI Compliance Check ---
+        scheduler.add_job(
+            func=check_edi_compliance_job,
+            trigger='cron', 
+            day_of_week='tue', 
+            hour=16, 
+            minute=52,
+            id='compliance_check',
+            replace_existing=True
+        )
+
+        # 4. Start the scheduler
+        scheduler.start()
+        app_scheduler = scheduler
+        app.logger.info("✅ SUCCESS: Master Scheduler started with lock ID 999.")
+        
+        # Ensure scheduler shuts down gracefully on app exit
+        atexit.register(lambda: scheduler.shutdown(wait=False))
+        
+        return scheduler
+
+    except Exception as e:
+        app.logger.error(f"❌ Failed to initialize scheduler: {e}")
+        if scheduler_db_conn:
+            scheduler_db_conn.close()
+            scheduler_db_conn = None
         return None
-
-    # 2. Only the "Master" worker proceeds to setup the Cron
-    tunisia_tz = pytz.timezone('Africa/Tunis')
-    scheduler = BackgroundScheduler(timezone=tunisia_tz)
-    
-    # Tuesday Cron
-    scheduler.add_job(
-        func=scheduled_analysis_job,
-        trigger='cron', day_of_week='tue', hour=14, minute=29,
-        id='tuesday_analysis'
-    )
-    
-    # Friday Cron
-    scheduler.add_job(
-        func=scheduled_analysis_job,
-        trigger='cron', day_of_week='fri', hour=14, minute=0,
-        id='friday_analysis'
-    )
-    
-    scheduler.add_job(
-        func=check_edi_compliance_job,
-        trigger='cron', day_of_week='tue', hour=14, minute=28,
-        id='compliance_check', name='EDI Compliance Check'
-    )
-
-    scheduler.start()
-    app.logger.info("✅ CRON SCHEDULER STARTED ON MASTER WORKER")
-    return scheduler
 
 
 # ========================= START SCHEDULER =========================
@@ -4815,8 +4858,6 @@ if 'gunicorn' in os.environ.get('SERVER_SOFTWARE', '').lower():
 # 2. Local Dev Guard: Prevent Werkzeug double-start
 elif os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
     app_scheduler = init_scheduler()
-
-
 
 
 
