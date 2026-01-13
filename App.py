@@ -9,7 +9,7 @@ import psycopg2
 import pdfplumber
 import PyPDF2
 from psycopg2 import errors
-from datetime import datetime ,date
+from datetime import datetime ,date, timedelta
 import re
 from collections import defaultdict , Counter
 import os
@@ -22,7 +22,8 @@ import requests
 from flask_mail import Mail, Message
 import openai
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
+import atexit
+import pytz
 
 app = Flask(__name__)
 
@@ -4752,13 +4753,6 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
 
 # ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
-# Place this BEFORE the "if __name__ == '__main__':" block
-
-import atexit
-from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
-import pytz
-
 
 def init_scheduler():
     # 1. Use a database connection to try and get an advisory lock
@@ -4827,6 +4821,8 @@ elif os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
 
 
 
+
+
 @app.route("/test-scheduler", methods=["GET"])
 def test_scheduler():
     """Check if scheduler is running and list jobs"""
@@ -4856,8 +4852,9 @@ def trigger_compliance_check():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# --- MAIN BLOCK ---
+# ========================= MAIN BLOCK (FOR LOCAL DEV ONLY) =========================
 if __name__ == "__main__":
-    # If running locally via 'python App.py', the guard above handles it.
+    # This block ONLY runs when you execute: python App.py
+    # It does NOT run in Azure/Gunicorn
+    app.logger.info("Running in development mode (python App.py)")
     app.run(host='0.0.0.0', port=5001, debug=True)
-
