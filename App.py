@@ -28,12 +28,12 @@ import pytz
 
 # --- Flask-Mail Configuration (Outlook SMTP) ---
 
-
+app = Flask(__name__)
 # ... existing DB config ...
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
-app = Flask(__name__)
+
 
 app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
 app.config['MAIL_PORT'] = 25
@@ -4795,7 +4795,7 @@ def init_scheduler():
             trigger='cron', 
             day_of_week='tue', 
             hour=17, 
-            minute=10,
+            minute=15,
             id='tuesday_analysis',
             replace_existing=True
         )
@@ -4817,7 +4817,7 @@ def init_scheduler():
             trigger='cron', 
             day_of_week='tue', 
             hour=17, 
-            minute=05,
+            minute=12,
             id='compliance_check',
             replace_existing=True
         )
