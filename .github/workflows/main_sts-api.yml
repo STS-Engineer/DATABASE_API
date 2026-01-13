@@ -70,13 +70,10 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_15D73801BB284636813620089175BCEF }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_31D4E421DC8F46228CE3879AA027E992 }}
 
-      - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
-        id: deploy-to-webapp
+      - name: 'Configure Azure App Service Settings'
+        uses: azure/appservice-settings@v1
         with:
           app-name: 'sts-api'
-          slot-name: 'Production'
-          # This setting renames files that are currently locked by the Python process
           app-settings-json: |
             [
                 {
@@ -85,3 +82,9 @@ jobs:
                     "slotSetting": false
                 }
             ]
+
+      - name: 'Deploy to Azure Web App'
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'sts-api'
+          slot-name: 'Production'
