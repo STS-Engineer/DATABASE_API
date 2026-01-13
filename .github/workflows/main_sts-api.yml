@@ -76,4 +76,12 @@ jobs:
         with:
           app-name: 'sts-api'
           slot-name: 'Production'
-          
+          # This setting renames files that are currently locked by the Python process
+          app-settings-json: |
+            [
+                {
+                    "name": "MSDEPLOY_RENAME_LOCKED_FILES",
+                    "value": "1",
+                    "slotSetting": false
+                }
+            ]
