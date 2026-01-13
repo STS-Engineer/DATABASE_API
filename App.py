@@ -4751,152 +4751,261 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
 
 
-# ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
-# Place this BEFORE the "if __name__ == '__main__':" block
+# ========================= SCHEDULER SETUP (FIXED) =========================
+
+import os
+import atexit
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 # --- GLOBAL VARIABLES ---
-# We keep the connection object globally so the lock is not released by the garbage collector
 scheduler_db_conn = None 
 app_scheduler = None
+SCHEDULER_LOCK_ID = 999  # Unique ID for advisory lock
 
 def init_scheduler():
     """
-    Initializes the BackgroundScheduler only on a single worker using 
-    a PostgreSQL Advisory Lock to prevent duplicate reports.
+    Initializes the BackgroundScheduler using PostgreSQL Advisory Lock.
+    Only ONE worker across all instances will run the scheduler.
     """
     global scheduler_db_conn, app_scheduler
     
     try:
-        # 1. Establish a dedicated connection for the lock
+        app.logger.info("🔧 Attempting to initialize scheduler...")
+        
+        # 1. Establish a PERSISTENT connection for the lock
         scheduler_db_conn = get_pg_connection()
+        scheduler_db_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         
-        # Advisory locks work best in autocommit mode
-        scheduler_db_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-        cur = scheduler_db_conn.cursor()
+        with scheduler_db_conn.cursor() as cur:
+            # 2. Try to acquire advisory lock (session-level, NOT transaction-level)
+            cur.execute("SELECT pg_try_advisory_lock(%s);", (SCHEDULER_LOCK_ID,))
+            is_master = cur.fetchone()[0]
         
-        # 2. Attempt to acquire a session-level advisory lock with ID 999
-        # This returns True if this specific worker is the first to grab it
-        cur.execute("SELECT pg_try_advisory_lock(999);")
-        is_master = cur.fetchone()[0]
-
         if not is_master:
-            app.logger.info("Scheduler lock held by another worker. This worker will stay in standby.")
-            scheduler_db_conn.close()
-            scheduler_db_conn = None
+            app.logger.info("⏸️  Another worker holds the scheduler lock. Standing by.")
+            # DON'T close the connection - keep trying in case master dies
             return None
-
-        # 3. Only the 'Winner' worker reaches this point
-        tunisia_tz = pytz.timezone('Africa/Tunis')
-        scheduler = BackgroundScheduler(timezone=tunisia_tz)
         
-        # --- JOB 1: Tuesday Analysis Report ---
+        # 3. This worker is the MASTER - start scheduler
+        app.logger.info("🎯 MASTER WORKER: Starting scheduler with lock ID %d", SCHEDULER_LOCK_ID)
+        
+        # Use UTC internally, convert in job functions
+        scheduler = BackgroundScheduler(timezone=pytz.UTC)
+        
+        # --- JOB 1: Tuesday Analysis Report (Tunisia time: 17:15) ---
+        # Tunisia is UTC+1, so 17:15 CET = 16:15 UTC
         scheduler.add_job(
             func=scheduled_analysis_job,
-            trigger='cron', 
-            day_of_week='tue', 
-            hour=17, 
-            minute=15,
+            trigger=CronTrigger(
+                day_of_week='tue',
+                hour=16,  # 17:15 Tunisia = 16:15 UTC
+                minute=15,
+                timezone=pytz.UTC
+            ),
             id='tuesday_analysis',
-            replace_existing=True
+            replace_existing=True,
+            max_instances=1  # Prevent overlapping runs
         )
         
-        # --- JOB 2: Friday Analysis Report ---
+        # --- JOB 2: Friday Analysis Report (Tunisia time: 14:00) ---
         scheduler.add_job(
             func=scheduled_analysis_job,
-            trigger='cron', 
-            day_of_week='fri', 
-            hour=14, 
-            minute=0,
+            trigger=CronTrigger(
+                day_of_week='fri',
+                hour=13,  # 14:00 Tunisia = 13:00 UTC
+                minute=0,
+                timezone=pytz.UTC
+            ),
             id='friday_analysis',
-            replace_existing=True
+            replace_existing=True,
+            max_instances=1
         )
         
-        # --- JOB 3: Weekly EDI Compliance Check ---
+        # --- JOB 3: Weekly EDI Compliance Check (Tunisia time: 17:12) ---
         scheduler.add_job(
             func=check_edi_compliance_job,
-            trigger='cron', 
-            day_of_week='tue', 
-            hour=17, 
-            minute=12,
+            trigger=CronTrigger(
+                day_of_week='tue',
+                hour=16,  # 17:12 Tunisia = 16:12 UTC
+                minute=12,
+                timezone=pytz.UTC
+            ),
             id='compliance_check',
-            replace_existing=True
+            replace_existing=True,
+            max_instances=1
         )
-
+        
         # 4. Start the scheduler
         scheduler.start()
         app_scheduler = scheduler
-        app.logger.info("✅ SUCCESS: Master Scheduler started with lock ID 999.")
         
-        # Ensure scheduler shuts down gracefully on app exit
-        atexit.register(lambda: scheduler.shutdown(wait=False))
+        # Log next run times
+        for job in scheduler.get_jobs():
+            app.logger.info("📅 Scheduled: %s - Next run: %s", job.id, job.next_run_time)
+        
+        # 5. Cleanup on shutdown
+        def cleanup_scheduler():
+            app.logger.info("🛑 Shutting down scheduler...")
+            if scheduler and scheduler.running:
+                scheduler.shutdown(wait=False)
+            if scheduler_db_conn and not scheduler_db_conn.closed:
+                with scheduler_db_conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s);", (SCHEDULER_LOCK_ID,))
+                scheduler_db_conn.close()
+                app.logger.info("🔓 Released scheduler lock")
+        
+        atexit.register(cleanup_scheduler)
         
         return scheduler
-
+    
     except Exception as e:
-        app.logger.error(f"❌ Failed to initialize scheduler: {e}")
-        if scheduler_db_conn:
-            scheduler_db_conn.close()
-            scheduler_db_conn = None
+        app.logger.error("❌ Scheduler initialization failed: %s", e, exc_info=True)
+        if scheduler_db_conn and not scheduler_db_conn.closed:
+            try:
+                scheduler_db_conn.close()
+            except:
+                pass
         return None
 
 
-# ========================= START SCHEDULER =========================
-# This runs when the module is imported (works with Gunicorn/Azure)
+# ========================= STARTUP LOGIC =========================
 
-app_scheduler = None
-
-# 1. Gunicorn Guard: Only start in one worker
-if 'gunicorn' in os.environ.get('SERVER_SOFTWARE', '').lower():
-    if not os.environ.get('SCHEDULER_STARTED'):
-        try:
-            app_scheduler = init_scheduler()
-            if app_scheduler:
-                os.environ['SCHEDULER_STARTED'] = '1'
-        except Exception as e:
-            app.logger.error(f"Failed to start scheduler: {e}")
-
-# 2. Local Dev Guard: Prevent Werkzeug double-start
-elif os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-    app_scheduler = init_scheduler()
-
-
-
+def should_start_scheduler():
+    """
+    Determine if THIS process should attempt to start the scheduler.
+    Returns True only once per application lifecycle.
+    """
+    # Check if already initialized
+    if 'SCHEDULER_INITIALIZED' in os.environ:
+        return False
+    
+    # Mark as initialized (prevents re-entry)
+    os.environ['SCHEDULER_INITIALIZED'] = '1'
+    
+    # For Werkzeug reloader (local dev), only run in main process
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        return False
+    
+    return True
 
 
+# ========================= MODULE-LEVEL INITIALIZATION =========================
+
+# Initialize scheduler when module loads (works with Gunicorn/Azure)
+if should_start_scheduler():
+    try:
+        app.logger.info("🚀 Initializing scheduler on module load...")
+        app_scheduler = init_scheduler()
+        if app_scheduler:
+            app.logger.info("✅ Scheduler started successfully")
+        else:
+            app.logger.info("ℹ️  Scheduler not started (another worker is master)")
+    except Exception as e:
+        app.logger.error("❌ Failed to start scheduler: %s", e, exc_info=True)
+
+
+# ========================= MANUAL TRIGGER ENDPOINTS =========================
 
 @app.route("/test-scheduler", methods=["GET"])
 def test_scheduler():
-    """Check if scheduler is running and list jobs"""
+    """Check scheduler status and list all jobs"""
     try:
-        if 'app_scheduler' in globals():
+        if app_scheduler and app_scheduler.running:
             jobs = app_scheduler.get_jobs()
+            job_info = []
+            for j in jobs:
+                job_info.append({
+                    "id": j.id,
+                    "name": j.name,
+                    "next_run": str(j.next_run_time),
+                    "trigger": str(j.trigger)
+                })
+            
             return jsonify({
                 "status": "running",
-                "jobs": [{"id": j.id, "name": j.name, "next_run": str(j.next_run_time)} for j in jobs]
+                "job_count": len(jobs),
+                "jobs": job_info,
+                "lock_id": SCHEDULER_LOCK_ID
             }), 200
         else:
-            return jsonify({"status": "error", "message": "Scheduler not initialized"}), 500
+            return jsonify({
+                "status": "not_running",
+                "message": "Scheduler not active on this worker"
+            }), 200
+            
     except Exception as e:
+        app.logger.exception("Error checking scheduler")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+@app.route("/trigger-analysis", methods=["POST"])
+def trigger_analysis_manual():
+    """Manually trigger the analysis report job"""
+    try:
+        app.logger.info("📤 Manual analysis report triggered")
+        scheduled_analysis_job()
+        return jsonify({
+            "status": "success",
+            "message": "Analysis report job completed"
+        }), 200
+    except Exception as e:
+        app.logger.exception("Error in manual analysis trigger")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/trigger-compliance-check", methods=["POST"])
 def trigger_compliance_check():
     """Manually trigger the compliance check"""
     try:
-        app.logger.info("Manual compliance check triggered via API")
+        app.logger.info("📋 Manual compliance check triggered")
         check_edi_compliance_job()
-        return jsonify({"status": "success", "message": "Compliance check completed"}), 200
+        return jsonify({
+            "status": "success",
+            "message": "Compliance check completed"
+        }), 200
     except Exception as e:
         app.logger.exception("Error in manual compliance trigger")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ========================= HEALTHCHECK ENDPOINT =========================
 
-# ========================= MAIN BLOCK (FOR LOCAL DEV ONLY) =========================
+@app.route("/scheduler-health", methods=["GET"])
+def scheduler_health():
+    """
+    Health check endpoint for monitoring.
+    Returns detailed scheduler status.
+    """
+    try:
+        status = {
+            "scheduler_exists": app_scheduler is not None,
+            "scheduler_running": app_scheduler.running if app_scheduler else False,
+            "lock_connection_open": scheduler_db_conn is not None and not scheduler_db_conn.closed,
+            "environment": {
+                "initialized": os.environ.get('SCHEDULER_INITIALIZED'),
+                "werkzeug_main": os.environ.get('WERKZEUG_RUN_MAIN')
+            }
+        }
+        
+        if app_scheduler and app_scheduler.running:
+            status["jobs"] = [j.id for j in app_scheduler.get_jobs()]
+            status["next_runs"] = {
+                j.id: str(j.next_run_time) 
+                for j in app_scheduler.get_jobs()
+            }
+        
+        return jsonify(status), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ========================= MAIN BLOCK (LOCAL DEV) =========================
+
 if __name__ == "__main__":
-    # This block ONLY runs when you execute: python App.py
-    # It does NOT run in Azure/Gunicorn
-    app.logger.info("Running in development mode (python App.py)")
+    app.logger.info("🔧 Running in development mode")
     app.run(host='0.0.0.0', port=5001, debug=True)
