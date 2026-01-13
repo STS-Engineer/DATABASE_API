@@ -4776,7 +4776,7 @@ def init_scheduler():
     # --- PRODUCTION JOBS ---
     scheduler.add_job(
         func=scheduled_analysis_job,
-        trigger='cron', day_of_week='tue', hour=12, minute=00,
+        trigger='cron', day_of_week='tue', hour=12, minute=35,
         id='tuesday_analysis', name='Tuesday Analysis Report'
     )
     
@@ -4788,7 +4788,7 @@ def init_scheduler():
     
     scheduler.add_job(
         func=check_edi_compliance_job,
-        trigger='cron', day_of_week='tue', hour=11, minute=59,
+        trigger='cron', day_of_week='tue', hour=12, minute=30,
         id='compliance_check', name='EDI Compliance Check'
     )
     
