@@ -9,7 +9,7 @@ import psycopg2
 import pdfplumber
 import PyPDF2
 from psycopg2 import errors
-from datetime import datetime ,date
+from datetime import datetime ,date, timedelta
 import re
 from collections import defaultdict , Counter
 import os
@@ -22,7 +22,8 @@ import requests
 from flask_mail import Mail, Message
 import openai
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
+import atexit
+import pytz
 
 app = Flask(__name__)
 
@@ -4754,20 +4755,22 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 # ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
 # Place this BEFORE the "if __name__ == '__main__':" block
 
-import atexit
-from apscheduler.schedulers.background import BackgroundScheduler
-
 def init_scheduler():
-    """Initialize and start the background scheduler"""
-    scheduler = BackgroundScheduler()
+    """Initialize and start the background scheduler with Tunisia timezone"""
     
-    # Production jobs
+    # Define Tunisia timezone
+    tunisia_tz = pytz.timezone('Africa/Tunis')  # UTC+1
+    
+    scheduler = BackgroundScheduler(timezone=tunisia_tz)
+    
+    # Production jobs - now in Tunisia time
     scheduler.add_job(
         func=scheduled_analysis_job,
         trigger='cron',
         day_of_week='tue',
-        hour=8,
-        minute=0,
+        hour=10,
+        minute=59,
+        timezone=tunisia_tz,  # Explicit timezone
         id='tuesday_analysis',
         name='Tuesday Analysis Report'
     )
@@ -4778,6 +4781,7 @@ def init_scheduler():
         day_of_week='fri',
         hour=14,
         minute=0,
+        timezone=tunisia_tz,
         id='friday_analysis',
         name='Friday Analysis Report'
     )
@@ -4787,23 +4791,29 @@ def init_scheduler():
         trigger='cron',
         day_of_week='tue',
         hour=10,
-        minute=45,
+        minute=58,
+        timezone=tunisia_tz,
         id='compliance_check',
         name='EDI Compliance Check'
     )
-     
+    
+    
     scheduler.start()
     app.logger.info("=" * 60)
-    app.logger.info("SCHEDULER STARTED SUCCESSFULLY")
+    app.logger.info("SCHEDULER STARTED (Tunisia Timezone)")
+    app.logger.info(f"Current Tunisia time: {datetime.now(tunisia_tz)}")
     app.logger.info(f"Total jobs scheduled: {len(scheduler.get_jobs())}")
     for job in scheduler.get_jobs():
-        app.logger.info(f"  - {job.name} (ID: {job.id})")
+        next_run_tunisia = job.next_run_time.astimezone(tunisia_tz) if job.next_run_time else None
+        app.logger.info(f"  - {job.name}")
+        app.logger.info(f"    Next run (UTC): {job.next_run_time}")
+        app.logger.info(f"    Next run (Tunisia): {next_run_tunisia}")
     app.logger.info("=" * 60)
     
-    # Ensure graceful shutdown
     atexit.register(lambda: scheduler.shutdown(wait=False))
     
     return scheduler
+
 
 # ========================= START SCHEDULER =========================
 # This runs when the module is imported (works with Gunicorn/Azure)
