@@ -4754,52 +4754,46 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
 # ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
 
-import fcntl
-
 def init_scheduler():
-    """Initialize the scheduler with a file lock to prevent multiple instances."""
-    # Attempt to create/open a lock file
-    f = open("scheduler.lock", "wb")
-    try:
-        # LOCK_EX = Exclusive lock
-        # LOCK_NB = Non-blocking (fail if someone else has it)
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, AttributeError):
-        # On Windows or if lock is held, this will fail
-        # Note: fcntl is for Linux (Azure). For Windows local dev, use a different check.
-        app.logger.info("Scheduler lock held by another process. Skipping initialization.")
+    # 1. Use a database connection to try and get an advisory lock
+    conn = get_pg_connection()
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+    
+    # We use a random ID (e.g., 999) to represent the "Scheduler Lock"
+    cur.execute("SELECT pg_try_advisory_lock(999);")
+    is_master_worker = cur.fetchone()[0]
+
+    if not is_master_worker:
+        # This worker didn't get the lock, it remains silent
         return None
 
+    # 2. Only the "Master" worker proceeds to setup the Cron
     tunisia_tz = pytz.timezone('Africa/Tunis')
     scheduler = BackgroundScheduler(timezone=tunisia_tz)
     
-    # --- PRODUCTION JOBS ---
+    # Tuesday Cron
     scheduler.add_job(
         func=scheduled_analysis_job,
-        trigger='cron', day_of_week='tue', hour=12, minute=35,
-        id='tuesday_analysis', name='Tuesday Analysis Report'
+        trigger='cron', day_of_week='tue', hour=14, minute=29,
+        id='tuesday_analysis'
     )
     
+    # Friday Cron
     scheduler.add_job(
         func=scheduled_analysis_job,
         trigger='cron', day_of_week='fri', hour=14, minute=0,
-        id='friday_analysis', name='Friday Analysis Report'
+        id='friday_analysis'
     )
     
     scheduler.add_job(
         func=check_edi_compliance_job,
-        trigger='cron', day_of_week='tue', hour=12, minute=55,
+        trigger='cron', day_of_week='tue', hour=14, minute=28,
         id='compliance_check', name='EDI Compliance Check'
     )
-    
-    # --- IMPORTANT: REMOVE THE "STARTUP TEST JOB" ---
-    # This was likely the main cause of the infinite loop. 
-    # If the app restarts, it fires immediately. Do not use 'date' triggers for startup tests.
 
     scheduler.start()
-    app.logger.info("✅ SCHEDULER STARTED - Locked to this process.")
-    
-    atexit.register(lambda: scheduler.shutdown(wait=False))
+    app.logger.info("✅ CRON SCHEDULER STARTED ON MASTER WORKER")
     return scheduler
 
 
