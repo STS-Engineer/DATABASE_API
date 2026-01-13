@@ -4852,6 +4852,7 @@ def trigger_compliance_check():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+
 # ========================= MAIN BLOCK (FOR LOCAL DEV ONLY) =========================
 if __name__ == "__main__":
     # This block ONLY runs when you execute: python App.py
