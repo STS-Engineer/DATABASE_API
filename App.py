@@ -4788,7 +4788,7 @@ def init_scheduler():
     
     scheduler.add_job(
         func=check_edi_compliance_job,
-        trigger='cron', day_of_week='tue', hour=12, minute=30,
+        trigger='cron', day_of_week='tue', hour=12, minute=55,
         id='compliance_check', name='EDI Compliance Check'
     )
     
