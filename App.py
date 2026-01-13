@@ -4775,7 +4775,7 @@ def init_scheduler():
     # Tuesday Cron
     scheduler.add_job(
         func=scheduled_analysis_job,
-        trigger='cron', day_of_week='tue', hour=14, minute=29,
+        trigger='cron', day_of_week='tue', hour=15, minute=10,
         id='tuesday_analysis'
     )
     
@@ -4788,7 +4788,7 @@ def init_scheduler():
     
     scheduler.add_job(
         func=check_edi_compliance_job,
-        trigger='cron', day_of_week='tue', hour=14, minute=28,
+        trigger='cron', day_of_week='tue', hour=15, minute=7,
         id='compliance_check', name='EDI Compliance Check'
     )
 
