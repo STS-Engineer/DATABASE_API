@@ -4755,24 +4755,23 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 if __name__ == "__main__":
     # ONLY start the scheduler if we are in the reloader process (the child process)
     # This prevents the parent process from starting a duplicate scheduler.
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        scheduler = BackgroundScheduler()
+    scheduler = BackgroundScheduler()
         
         # Run Monday at 08:00 AM
-        scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='tue', hour=8, minute=0)
+    scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='tue', hour=8, minute=0)
         
         # Run Friday at 04:00 PM
-        scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='fri', hour=14, minute=0)
+    scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='fri', hour=14, minute=0)
         
          # 2. NEW: Compliance Alert System
         # Runs every Tuesday at 09:00 AM (Giving them Monday to upload)
-        scheduler.add_job(func=check_edi_compliance_job, trigger='cron', day_of_week='tue', hour=9, minute=0)
+    scheduler.add_job(func=check_edi_compliance_job, trigger='cron', day_of_week='tue', hour=9, minute=0)
 
         # (Optional: Test Trigger for today)
-        scheduler.add_job(func=check_edi_compliance_job, trigger='date', run_date=datetime.now() + timedelta(seconds=10))
+    scheduler.add_job(func=check_edi_compliance_job, trigger='date', run_date=datetime.now() + timedelta(seconds=10))
 
 
-        scheduler.start()
-        logging.info("Scheduler started successfully (Reloader Process Only).")
+    scheduler.start()
+    logging.info("Scheduler started successfully (Reloader Process Only).")
 
     app.run(host='0.0.0.0', port=5001, debug=True)
