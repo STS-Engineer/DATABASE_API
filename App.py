@@ -4751,27 +4751,114 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
 
 
+# ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
+# Place this BEFORE the "if __name__ == '__main__':" block
 
-if __name__ == "__main__":
-    # ONLY start the scheduler if we are in the reloader process (the child process)
-    # This prevents the parent process from starting a duplicate scheduler.
+import atexit
+from apscheduler.schedulers.background import BackgroundScheduler
+
+def init_scheduler():
+    """Initialize and start the background scheduler"""
     scheduler = BackgroundScheduler()
-        
-        # Run Monday at 08:00 AM
-    scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='tue', hour=8, minute=0)
-        
-        # Run Friday at 04:00 PM
-    scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='fri', hour=14, minute=0)
-        
-         # 2. NEW: Compliance Alert System
-        # Runs every Tuesday at 09:00 AM (Giving them Monday to upload)
-    scheduler.add_job(func=check_edi_compliance_job, trigger='cron', day_of_week='tue', hour=9, minute=0)
-
-        # (Optional: Test Trigger for today)
-    scheduler.add_job(func=check_edi_compliance_job, trigger='date', run_date=datetime.now() + timedelta(seconds=10))
-
-
+    
+    # Production jobs
+    scheduler.add_job(
+        func=scheduled_analysis_job,
+        trigger='cron',
+        day_of_week='tue',
+        hour=8,
+        minute=0,
+        id='tuesday_analysis',
+        name='Tuesday Analysis Report'
+    )
+    
+    scheduler.add_job(
+        func=scheduled_analysis_job,
+        trigger='cron',
+        day_of_week='fri',
+        hour=14,
+        minute=0,
+        id='friday_analysis',
+        name='Friday Analysis Report'
+    )
+    
+    scheduler.add_job(
+        func=check_edi_compliance_job,
+        trigger='cron',
+        day_of_week='tue',
+        hour=9,
+        minute=0,
+        id='compliance_check',
+        name='EDI Compliance Check'
+    )
+    
+    # Test job - runs 30 seconds after startup (works in both dev and prod)
+    scheduler.add_job(
+        func=check_edi_compliance_job,
+        trigger='date',
+        run_date=datetime.now() + timedelta(seconds=30),
+        id='test_compliance_startup',
+        name='Test Compliance on Startup'
+    )
+    
     scheduler.start()
-    logging.info("Scheduler started successfully (Reloader Process Only).")
+    app.logger.info("=" * 60)
+    app.logger.info("SCHEDULER STARTED SUCCESSFULLY")
+    app.logger.info(f"Total jobs scheduled: {len(scheduler.get_jobs())}")
+    for job in scheduler.get_jobs():
+        app.logger.info(f"  - {job.name} (ID: {job.id})")
+    app.logger.info("=" * 60)
+    
+    # Ensure graceful shutdown
+    atexit.register(lambda: scheduler.shutdown(wait=False))
+    
+    return scheduler
 
+# ========================= START SCHEDULER =========================
+# This runs when the module is imported (works with Gunicorn/Azure)
+try:
+    app_scheduler = init_scheduler()
+except Exception as e:
+    app.logger.error(f"FAILED TO START SCHEDULER: {e}", exc_info=True)
+
+
+
+
+
+
+
+@app.route("/test-scheduler", methods=["GET"])
+def test_scheduler():
+    """Check if scheduler is running and list jobs"""
+    try:
+        if 'app_scheduler' in globals():
+            jobs = app_scheduler.get_jobs()
+            return jsonify({
+                "status": "running",
+                "jobs": [{"id": j.id, "name": j.name, "next_run": str(j.next_run_time)} for j in jobs]
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "Scheduler not initialized"}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
+@app.route("/trigger-compliance-check", methods=["POST"])
+def trigger_compliance_check():
+    """Manually trigger the compliance check"""
+    try:
+        app.logger.info("Manual compliance check triggered via API")
+        check_edi_compliance_job()
+        return jsonify({"status": "success", "message": "Compliance check completed"}), 200
+    except Exception as e:
+        app.logger.exception("Error in manual compliance trigger")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ========================= MAIN BLOCK (FOR LOCAL DEV ONLY) =========================
+if __name__ == "__main__":
+    # This block ONLY runs when you execute: python App.py
+    # It does NOT run in Azure/Gunicorn
+    app.logger.info("Running in development mode (python App.py)")
     app.run(host='0.0.0.0', port=5001, debug=True)
