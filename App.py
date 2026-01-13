@@ -4802,8 +4802,8 @@ def init_scheduler():
             func=scheduled_analysis_job,
             trigger=CronTrigger(
                 day_of_week='tue',
-                hour=16,  # 17:15 Tunisia = 16:15 UTC
-                minute=15,
+                hour=17,  # 17:15 Tunisia = 16:15 UTC
+                minute=50,
                 timezone=pytz.UTC
             ),
             id='tuesday_analysis',
@@ -4830,8 +4830,8 @@ def init_scheduler():
             func=check_edi_compliance_job,
             trigger=CronTrigger(
                 day_of_week='tue',
-                hour=16,  # 17:12 Tunisia = 16:12 UTC
-                minute=12,
+                hour=17,  # 17:12 Tunisia = 16:12 UTC
+                minute=45,
                 timezone=pytz.UTC
             ),
             id='compliance_check',
@@ -4879,33 +4879,54 @@ def should_start_scheduler():
     Determine if THIS process should attempt to start the scheduler.
     Returns True only once per application lifecycle.
     """
-    # Check if already initialized
-    if 'SCHEDULER_INITIALIZED' in os.environ:
-        return False
-    
-    # Mark as initialized (prevents re-entry)
-    os.environ['SCHEDULER_INITIALIZED'] = '1'
-    
     # For Werkzeug reloader (local dev), only run in main process
-    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+    if os.environ.get('WERKZEUG_RUN_MAIN') not in (None, 'true'):
+        app.logger.info("🔇 Skipping scheduler (Werkzeug reloader sub-process)")
         return False
+    
+    # Check if already initialized in THIS process
+    if hasattr(app, '_scheduler_init_attempted'):
+        app.logger.info("🔇 Scheduler init already attempted in this process")
+        return False
+    
+    # Mark as attempted (prevents re-entry)
+    app._scheduler_init_attempted = True
     
     return True
 
 
-# ========================= MODULE-LEVEL INITIALIZATION =========================
+# ========================= FORCE INITIALIZATION ON FIRST REQUEST =========================
 
-# Initialize scheduler when module loads (works with Gunicorn/Azure)
-if should_start_scheduler():
+@app.before_request
+def ensure_scheduler_started():
+    """
+    Lazy initialization: Start scheduler on first HTTP request.
+    This ensures Flask app context is fully ready.
+    """
+    global app_scheduler
+    
+    # Only try once per application instance
+    if hasattr(app, '_scheduler_bootstrap_done'):
+        return
+    
+    app._scheduler_bootstrap_done = True
+    
     try:
-        app.logger.info("🚀 Initializing scheduler on module load...")
+        # Double-check it's not already running
+        if app_scheduler and app_scheduler.running:
+            app.logger.info("✅ Scheduler already running")
+            return
+        
+        app.logger.info("🚀 BOOTSTRAP: Starting scheduler on first request...")
         app_scheduler = init_scheduler()
+        
         if app_scheduler:
-            app.logger.info("✅ Scheduler started successfully")
+            app.logger.info("✅ Scheduler successfully started via bootstrap")
         else:
             app.logger.info("ℹ️  Scheduler not started (another worker is master)")
+            
     except Exception as e:
-        app.logger.error("❌ Failed to start scheduler: %s", e, exc_info=True)
+        app.logger.error("❌ Scheduler bootstrap failed: %s", e, exc_info=True)
 
 
 # ========================= MANUAL TRIGGER ENDPOINTS =========================
@@ -4939,6 +4960,44 @@ def test_scheduler():
             
     except Exception as e:
         app.logger.exception("Error checking scheduler")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/force-start-scheduler", methods=["POST"])
+def force_start_scheduler():
+    """
+    ADMIN ENDPOINT: Force-start the scheduler even if lock is held.
+    Use this ONLY for debugging/recovery.
+    """
+    global app_scheduler
+    
+    try:
+        # Check current state
+        if app_scheduler and app_scheduler.running:
+            return jsonify({
+                "status": "already_running",
+                "message": "Scheduler is already active"
+            }), 200
+        
+        app.logger.warning("⚠️  FORCE START requested - attempting to initialize scheduler")
+        
+        # Try to start
+        app_scheduler = init_scheduler()
+        
+        if app_scheduler and app_scheduler.running:
+            return jsonify({
+                "status": "success",
+                "message": "Scheduler force-started successfully",
+                "jobs": [j.id for j in app_scheduler.get_jobs()]
+            }), 200
+        else:
+            return jsonify({
+                "status": "failed",
+                "message": "Could not acquire scheduler lock (another worker is master)"
+            }), 409
+            
+    except Exception as e:
+        app.logger.exception("Error in force-start")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
