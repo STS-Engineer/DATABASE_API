@@ -4753,7 +4753,76 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
 
 # ========================= SCHEDULER SETUP (MODULE LEVEL) =========================
-# Place this BEFORE the "if __name__ == '__main__':" block
+
+import fcntl
+
+def init_scheduler():
+    """Initialize the scheduler with a file lock to prevent multiple instances."""
+    # Attempt to create/open a lock file
+    f = open("scheduler.lock", "wb")
+    try:
+        # LOCK_EX = Exclusive lock
+        # LOCK_NB = Non-blocking (fail if someone else has it)
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, AttributeError):
+        # On Windows or if lock is held, this will fail
+        # Note: fcntl is for Linux (Azure). For Windows local dev, use a different check.
+        app.logger.info("Scheduler lock held by another process. Skipping initialization.")
+        return None
+
+    tunisia_tz = pytz.timezone('Africa/Tunis')
+    scheduler = BackgroundScheduler(timezone=tunisia_tz)
+    
+    # --- PRODUCTION JOBS ---
+    scheduler.add_job(
+        func=scheduled_analysis_job,
+        trigger='cron', day_of_week='tue', hour=12, minute=00,
+        id='tuesday_analysis', name='Tuesday Analysis Report'
+    )
+    
+    scheduler.add_job(
+        func=scheduled_analysis_job,
+        trigger='cron', day_of_week='fri', hour=14, minute=0,
+        id='friday_analysis', name='Friday Analysis Report'
+    )
+    
+    scheduler.add_job(
+        func=check_edi_compliance_job,
+        trigger='cron', day_of_week='tue', hour=11, minute=59,
+        id='compliance_check', name='EDI Compliance Check'
+    )
+    
+    # --- IMPORTANT: REMOVE THE "STARTUP TEST JOB" ---
+    # This was likely the main cause of the infinite loop. 
+    # If the app restarts, it fires immediately. Do not use 'date' triggers for startup tests.
+
+    scheduler.start()
+    app.logger.info("✅ SCHEDULER STARTED - Locked to this process.")
+    
+    atexit.register(lambda: scheduler.shutdown(wait=False))
+    return scheduler
+
+
+# ========================= START SCHEDULER =========================
+# This runs when the module is imported (works with Gunicorn/Azure)
+
+app_scheduler = None
+
+# 1. Gunicorn Guard: Only start in one worker
+if 'gunicorn' in os.environ.get('SERVER_SOFTWARE', '').lower():
+    if not os.environ.get('SCHEDULER_STARTED'):
+        try:
+            app_scheduler = init_scheduler()
+            if app_scheduler:
+                os.environ['SCHEDULER_STARTED'] = '1'
+        except Exception as e:
+            app.logger.error(f"Failed to start scheduler: {e}")
+
+# 2. Local Dev Guard: Prevent Werkzeug double-start
+elif os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+    app_scheduler = init_scheduler()
+
+
 
 
 
