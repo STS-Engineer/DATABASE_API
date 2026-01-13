@@ -4518,6 +4518,239 @@ def get_product_details_route():
 
 
 
+# --- ESCALATION HIERARCHY ---
+# Define the email addresses for each escalation level
+ESCALATION_CONTACTS = {
+    "LogisticManager": "chaima.benyahia@avocarbon.com",
+    "GeneralManager": "chaima.benyahia@avocarbon.com",
+    "CEO": "chaima.benyahia@avocarbon.com"
+}
+
+# Map Client Codes to their specific Customer Service Rep (CS)
+# You can reuse CLIENT_OWNERS or define a specific map for alerts
+# Map Client Codes to their specific Customer Service Rep (CS)
+CLIENT_CS_MAP = {
+    # Existing & Updated Mappings
+    "C00409": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Nevers
+    "C00250": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Poland / Pologne
+    
+    # New Mappings
+    "C00126": "mohamedlaith.benmabrouk@avocarbon.com", # Nidec Pologne
+    "C00050": "mohamedlaith.benmabrouk@avocarbon.com", # Nidec ESP
+    "C00113": "mohamedlaith.benmabrouk@avocarbon.com", # Nidec DCK
+    "C00285": "mohamedlaith.benmabrouk@avocarbon.com", # Pierburg
+    "C00241": "mohamedlaith.benmabrouk@avocarbon.com", # Inteva GAD
+    "C00132": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Betigheim
+    "C00125": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Madrid
+    "C00303": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Mexique
+    "C00410": "mohamedlaith.benmabrouk@avocarbon.com", # Inteva Esson
+    "C00072": "mohamedlaith.benmabrouk@avocarbon.com" # Valeo Brasil
+}
+
+
+CLIENT_NAMES = {
+    "C00126": "Nidec Pologne",
+    "C00050": "Nidec ESP",
+    "C00113": "Nidec DCK",
+    "C00260": "Nidec Inde",
+    "C00285": "Pierburg",
+    "C00241": "Inteva GAD",
+    "C00132": "Valeo Betigheim",
+    "C00125": "Valeo Madrid",
+    "C00303": "Valeo Mexique",
+    "C00410": "Inteva Esson",
+    "C00250": "Valeo Pologne",
+    "C00072": "Valeo Brasil",
+    "C00409": "Valeo Nevers"
+}
+
+
+def check_edi_compliance_job():
+    """
+    Checks all clients mapped in CLIENT_CS_MAP.
+    Identifies EXACTLY which weeks are missing for each client.
+    Groups results by CS Email and sends a consolidated report.
+    """
+    with app.app_context():
+        logging.info("--- STARTING DETAILED COMPLIANCE CHECK ---")
+        
+        # 1. Prepare Week List (Current + 3 previous)
+        # We check these 4 specific weeks for presence
+        today = datetime.now()
+        weeks_to_check = []
+        for i in range(15):
+            d = today - timedelta(weeks=i)
+            iso_year, iso_week, _ = d.isocalendar()
+            weeks_to_check.append(f"{iso_year}-W{iso_week:02d}")
+        
+        # Structure: { 'email@avo.com': [ {'client': 'C001', 'missing_weeks': ['2026-W02', ...], 'streak': 2}, ... ] }
+        violations_by_email = defaultdict(list)
+
+        conn = get_pg_connection()
+        try:
+            with conn.cursor() as cur:
+                for client_code, cs_email in CLIENT_CS_MAP.items():
+                    
+                    # 2. Check existence for the last 4 weeks
+                    cur.execute("""
+                        SELECT DISTINCT "ForecastDate" 
+                        FROM public."EDIGlobal" 
+                        WHERE "ClientCode" = %s AND "ForecastDate" = ANY(%s)
+                    """, (client_code, weeks_to_check))
+                    
+                    found_weeks = {row[0] for row in cur.fetchall()}
+
+                    # 3. Identify Missing Weeks & Calculate Streak
+                    missing_weeks = []
+                    current_streak = 0
+                    streak_broken = False
+
+                    # Iterate from newest to oldest
+                    for w in weeks_to_check:
+                        if w not in found_weeks:
+                            missing_weeks.append(w)
+                            if not streak_broken:
+                                current_streak += 1
+                        else:
+                            streak_broken = True # Data found, so the consecutive "missing" streak stops here
+                    
+                    # If there are ANY missing weeks, record the violation
+                    if missing_weeks:
+                        violations_by_email[cs_email].append({
+                            "client_code": client_code,
+                            "client_name": CLIENT_NAMES.get(client_code, "Unknown Client"),
+                            "missing_weeks": missing_weeks,
+                            "streak": current_streak # Streak determines escalation level
+                        })
+
+            # 4. Send Consolidated Emails
+            for email, violation_list in violations_by_email.items():
+                if violation_list:
+                    # Sort list so clients with highest streak appear first
+                    violation_list.sort(key=lambda x: x['streak'], reverse=True)
+                    send_detailed_escalation_email(email, violation_list, weeks_to_check[0])
+
+        except Exception as e:
+            logging.exception("Error in consolidated compliance check")
+        finally:
+            conn.close()
+
+
+def send_detailed_escalation_email(cs_email, violation_list, current_week):
+    """
+    Sends a table listing Client Name, Code, and the specific Missing Weeks.
+    Managers are added to CC based on the new timeline (GM at W4-5, CEO at W6).
+    """
+    # 1. Determine Escalation Level based on the worst streak
+    max_streak = max(item['streak'] for item in violation_list)
+
+    # RECIPIENT: Only the CS person is in the "To" field
+    recipients = [cs_email]
+    
+    # CC LIST: Starts with Admin
+    cc_list = ["edi.tunisia@avocarbon.com"] 
+    
+    subject = ""
+    severity_color = ""
+    escalation_msg = ""
+
+    # --- NEW ESCALATION TIMELINE ---
+    
+    if max_streak <= 1:
+        # Week 1: Reminder Only
+        subject = f"REMINDER: Missing EDI Files (Week {current_week})"
+        severity_color = "#f0ad4e" # Orange
+        escalation_msg = "Reminder (CS Only)"
+    
+    elif 2 <= max_streak <= 3:
+        # Weeks 2 & 3: CC Logistic Manager
+        cc_list.append(ESCALATION_CONTACTS["LogisticManager"])
+        
+        subject = f"ESCALATION L1: Missing EDI Files ({max_streak} Weeks)"
+        severity_color = "#d9534f" # Red
+        escalation_msg = "Level 1 (Logistic Manager in CC)"
+
+    elif 4 <= max_streak <= 5:
+        # Weeks 4 & 5: CC General Manager (+ Logistic Manager)
+        
+        cc_list.append(ESCALATION_CONTACTS["GeneralManager"])
+        cc_list.append(ESCALATION_CONTACTS["LogisticManager"])
+        
+        subject = f"ESCALATION L2: Missing EDI Files ({max_streak} Weeks)"
+        severity_color = "#c9302c" # Dark Red
+        escalation_msg = "Level 2 (General Manager in CC)"
+
+    elif max_streak >= 6:
+        # Week 6+: CC CEO (+ GM & Logistic Manager)
+        
+        
+        cc_list.append(ESCALATION_CONTACTS["CEO"])
+        cc_list.append(ESCALATION_CONTACTS["GeneralManager"])
+        cc_list.append(ESCALATION_CONTACTS["LogisticManager"])
+        
+        subject = f"CRITICAL: EDI PROCESS FAILURES ({max_streak} Weeks)"
+        severity_color = "#000000" # Black
+        escalation_msg = "CRITICAL (CEO in CC)"
+
+    # Remove duplicates from CC list
+    cc_list = list(set(cc_list))
+
+    # 2. Build Table Rows
+    table_rows = ""
+    for item in violation_list:
+        code = item['client_code']
+        name = item['client_name']
+        missing_weeks_str = ", ".join(item['missing_weeks'])
+        streak = item['streak']
+        
+        # Color the row red if it's a serious streak (2+ weeks), else standard
+        row_style = "color: red;" if streak >= 2 else ""
+        
+        table_rows += f"""
+        <tr>
+            <td style="padding: 10px; border: 1px solid #ddd;"><b>{name}</b></td>
+            <td style="padding: 10px; border: 1px solid #ddd;">{code}</td>
+            <td style="padding: 10px; border: 1px solid #ddd; {row_style}">
+                {missing_weeks_str}
+            </td>
+        </tr>
+        """
+
+    # 3. Email Body
+    html_body = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; color: #333;">
+            <div style="border-top: 5px solid {severity_color}; padding: 20px; background-color: #f9f9f9;">
+                <h2 style="color: {severity_color}; margin-top: 0;">{subject}</h2>
+                <p>Hello,</p>
+                <p>The following clients have missing EDI files.</p>
+                <p><b>Status:</b> {escalation_msg}</p>
+                
+                <table style="width: 100%; border-collapse: collapse; margin-top: 20px; background-color: white; font-size: 14px;">
+                    <tr style="background-color: #f2f2f2;">
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Client Name</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Code</th>
+                        <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Missing Weeks</th>
+                    </tr>
+                    {table_rows}
+                </table>
+
+                <p style="margin-top: 20px;"><strong>Action Required:</strong> Please upload the missing files immediately.</p>
+                <p style="font-size: 12px; color: #777;">Automated EDI Compliance System</p>
+            </div>
+        </body>
+    </html>
+    """
+
+    try:
+        msg = Message(subject=subject, recipients=recipients, cc=cc_list, html=html_body)
+        mail.send(msg)
+        logging.info(f"Detailed email sent to {cs_email} (Streak: {max_streak}, CC Count: {len(cc_list)})")
+    except Exception as e:
+        logging.error(f"Failed to send detailed email to {cs_email}: {e}")
+
+
+
 
 if __name__ == "__main__":
     # ONLY start the scheduler if we are in the reloader process (the child process)
@@ -4531,9 +4764,15 @@ if __name__ == "__main__":
         # Run Friday at 04:00 PM
         scheduler.add_job(func=scheduled_analysis_job, trigger='cron', day_of_week='fri', hour=14, minute=0)
         
-        
-        scheduler.start()
-        logging.info("Scheduler started successfully (Reloader Process Only).") 
+         # 2. NEW: Compliance Alert System
+        # Runs every Tuesday at 09:00 AM (Giving them Monday to upload)
+        scheduler.add_job(func=check_edi_compliance_job, trigger='cron', day_of_week='tue', hour=9, minute=0)
 
-    # Start Flask
+        # (Optional: Test Trigger for today)
+        scheduler.add_job(func=check_edi_compliance_job, trigger='date', run_date=datetime.now() + timedelta(seconds=10))
+
+
+        scheduler.start()
+        logging.info("Scheduler started successfully (Reloader Process Only).")
+
     app.run(host='0.0.0.0', port=5001, debug=True)
