@@ -232,8 +232,10 @@ def process_valeo_rows(rows, header):
 
             week_num = date_obj.isocalendar()[1]
             # If after Tuesday, push to next week
-            if date_obj.weekday() > 1:
+            if client_code == "C00125":
                 week_num += 1
+            elif date_obj.weekday() > 1:
+                week_num += 0
             forecast_date = f"{date_obj.year}-W{week_num:02d}"
 
             # --- Material + AVO mapping logic ---
@@ -263,7 +265,7 @@ def process_valeo_rows(rows, header):
                 "DateFrom": to_forecast_week(delivery_date),
                 "DateUntil": delivery_date,
                 "Quantity": int(row[idx['Despatch_Qty']].strip() or 0),
-                "ForecastDate": to_forecast_week(date_str),
+                "ForecastDate": forecast_date,
                 "LastDeliveryDate": to_forecast_week(row[idx['Last_Delivery_Note_Date']].strip()),
                 "LastDeliveredQuantity": int(row[idx['Last_Delivery_Quantity']].strip() or 0),
                 "CumulatedQuantity": int(row[idx['Cum_Quantity']].strip() or 0),
@@ -4240,9 +4242,10 @@ def send_report_endpoint():
 # --- Configuration: Mapping Owners to Client Codes ---
 # In a real scenario, fetch this from a DB table like "UserClients"
 CLIENT_OWNERS = {
-    "mohamedlaith.benmabrouk@avocarbon.com": ["C00409", "C00250", "C00132"], # Valeo Nevers, Poland, etc.
-    "chaima.benyahia@avocarbon.com": ["C00260", "C00113", "C00126", "C00409"], # Nidec sites
-    "edi.tunisia@avocarbon.com": None # None means "All Clients"
+    "fedia.chabbeh@avocarbon.com": ["C00125", "C00113", "C00260", "C00285", "C00132"], # Valeo Nevers, Poland, etc.
+    "lassaad.hajjem@avocarbon.com": ["C00126", "C00050"], # Nidec sites
+    "nihed.nabli@avocarbon.com": ["C00241", "C00303", "C00410", "C00250", "C00072", "C00409"], # None means "All Clients"
+    "edi.tunisia@avocarbon.com": None
 }
 
 def get_consecutive_weeks():
@@ -4262,29 +4265,26 @@ def get_consecutive_weeks():
 
 
 
-
-def get_past_weeks(offset_earlier, offset_later):
+def get_past_weeks(count):
     """
-    Returns a list of two ISO weeks relative to today.
-    Example: get_past_weeks(4, 3) returns [W-4, W-3]
+    Returns a list of N ISO weeks ending at the current week.
+    Example: get_past_weeks(3) returns [W-2, W-1, W-0]
     """
     today = datetime.now()
+    weeks = []
+    # We loop backwards from (count-1) to 0 to get weeks in chronological order
+    for i in range(count - 1, -1, -1):
+        target_date = today - timedelta(weeks=i)
+        year, week, _ = target_date.isocalendar()
+        weeks.append(f"{year}-W{week:02d}")
     
-    # Calculate the earlier week (e.g., 4 weeks ago)
-    date_earlier = today - timedelta(weeks=offset_earlier)
-    year_e, week_e, _ = date_earlier.isocalendar()
-    iso_earlier = f"{year_e}-W{week_e:02d}"
-    
-    # Calculate the later week (e.g., 3 weeks ago)
-    date_later = today - timedelta(weeks=offset_later)
-    year_l, week_l, _ = date_later.isocalendar()
-    iso_later = f"{year_l}-W{week_l:02d}"
-    
-    return [iso_earlier, iso_later]
+    logging.info(f"Generated {count} weeks for analysis: {weeks}")
+    return weeks
+
 
 def scheduled_analysis_job():
     with app.app_context():
-        weeks = get_past_weeks(1,0)
+        weeks = get_past_weeks(3)
         for email, client_list in CLIENT_OWNERS.items():
             report_payload = {
                 "forecastWeeks": weeks,
@@ -4521,9 +4521,9 @@ def get_product_details_route():
 # --- ESCALATION HIERARCHY ---
 # Define the email addresses for each escalation level
 ESCALATION_CONTACTS = {
-    "LogisticManager": "chaima.benyahia@avocarbon.com",
-    "GeneralManager": "chaima.benyahia@avocarbon.com",
-    "CEO": "chaima.benyahia@avocarbon.com"
+    "LogisticManager": "oussama.mastouri@avocarbon.com",
+    "GeneralManager": "imed.benalaya@avocarbon.com",
+    "CEO": ""#"chaima.benyahia@avocarbon.com"
 }
 
 # Map Client Codes to their specific Customer Service Rep (CS)
@@ -4531,20 +4531,16 @@ ESCALATION_CONTACTS = {
 # Map Client Codes to their specific Customer Service Rep (CS)
 CLIENT_CS_MAP = {
     # Existing & Updated Mappings
-    "C00409": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Nevers
-    "C00250": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Poland / Pologne
-    
-    # New Mappings
-    "C00126": "mohamedlaith.benmabrouk@avocarbon.com", # Nidec Pologne
-    "C00050": "mohamedlaith.benmabrouk@avocarbon.com", # Nidec ESP
-    "C00113": "mohamedlaith.benmabrouk@avocarbon.com", # Nidec DCK
-    "C00285": "mohamedlaith.benmabrouk@avocarbon.com", # Pierburg
-    "C00241": "mohamedlaith.benmabrouk@avocarbon.com", # Inteva GAD
-    "C00132": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Betigheim
-    "C00125": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Madrid
-    "C00303": "mohamedlaith.benmabrouk@avocarbon.com", # Valeo Mexique
-    "C00410": "mohamedlaith.benmabrouk@avocarbon.com", # Inteva Esson
-    "C00072": "mohamedlaith.benmabrouk@avocarbon.com" # Valeo Brasil
+    "C00409": "nihed.nabli@avocarbon.com", # Valeo Nevers
+    "C00250": "nihed.nabli@avocarbon.com", # Valeo Poland / Pologne
+    "C00126": "lassaad.hajjem@avocarbon.com", # Nidec Pologne
+    "C00050": "lassaad.hajjem@avocarbon.com", # Nidec ESP
+    "C00113": "fedia.chabbeh@avocarbon.com", # Nidec DCK
+    "C00285": "fedia.chabbeh@avocarbon.com", # Pierburg
+    "C00125": "fedia.chabbeh@avocarbon.com", # Valeo Madrid
+    "C00303": "nihed.nabli@avocarbon.com", # Valeo Mexique
+    "C00410": "nihed.nabli@avocarbon.com", # Inteva Esson
+    "C00072": "nihed.nabli@avocarbon.com", # Valeo Brasil
 }
 
 
@@ -4552,10 +4548,7 @@ CLIENT_NAMES = {
     "C00126": "Nidec Pologne",
     "C00050": "Nidec ESP",
     "C00113": "Nidec DCK",
-    "C00260": "Nidec Inde",
     "C00285": "Pierburg",
-    "C00241": "Inteva GAD",
-    "C00132": "Valeo Betigheim",
     "C00125": "Valeo Madrid",
     "C00303": "Valeo Mexique",
     "C00410": "Inteva Esson",
@@ -4802,8 +4795,8 @@ def init_scheduler():
             func=scheduled_analysis_job,
             trigger=CronTrigger(
                 day_of_week='tue',
-                hour=17,  # 17:15 Tunisia = 16:15 UTC
-                minute=50,
+                hour=13,  # 17:15 Tunisia = 16:15 UTC
+                minute=00,
                 timezone=pytz.UTC
             ),
             id='tuesday_analysis',
@@ -4829,9 +4822,23 @@ def init_scheduler():
         scheduler.add_job(
             func=check_edi_compliance_job,
             trigger=CronTrigger(
+                day_of_week='mon',
+                hour=13,  # 17:12 Tunisia = 16:12 UTC
+                minute=0,
+                timezone=pytz.UTC
+            ),
+            id='compliance_check',
+            replace_existing=True,
+            max_instances=1
+        )
+
+
+        scheduler.add_job(
+            func=check_edi_compliance_job,
+            trigger=CronTrigger(
                 day_of_week='tue',
-                hour=17,  # 17:12 Tunisia = 16:12 UTC
-                minute=45,
+                hour=7,  # 17:12 Tunisia = 16:12 UTC
+                minute=00,
                 timezone=pytz.UTC
             ),
             id='compliance_check',
