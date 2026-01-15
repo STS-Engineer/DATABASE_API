@@ -42,8 +42,8 @@ app.config['MAIL_DEFAULT_SENDER'] = 'administration.STS@avocarbon.com'
 
 # Initialize Mail
 mail = Mail(app)
-# Use your actual DATABASE_URL as an environment variable for better security!
-DATABASE_URL = "postgresql://adminavo:%24%23fKcdXPg4%40ue8AW@avo-adb-001.postgres.database.azure.com:5432/EDI%20IA"
+# Updated for Server 002 and administrationSTS user
+DATABASE_URL = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/EDI_IA"
 
 def get_pg_connection():
     return psycopg2.connect(DATABASE_URL)
