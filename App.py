@@ -4649,13 +4649,13 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
 
     # --- NEW ESCALATION TIMELINE ---
     
-    if max_streak <= 1:
+    if max_streak <= 2:
         # Week 1: Reminder Only
         subject = f"REMINDER: Missing EDI Files (Week {current_week})"
         severity_color = "#f0ad4e" # Orange
         escalation_msg = "Reminder (CS Only)"
     
-    elif 2 <= max_streak <= 3:
+    elif 3 <= max_streak <= 6:
         # Weeks 2 & 3: CC Logistic Manager
         cc_list.append(ESCALATION_CONTACTS["LogisticManager"])
         
@@ -4663,7 +4663,7 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
         severity_color = "#d9534f" # Red
         escalation_msg = "Level 1 (Logistic Manager in CC)"
 
-    elif 4 <= max_streak <= 5:
+    elif 7 <= max_streak <= 11:
         # Weeks 4 & 5: CC General Manager (+ Logistic Manager)
         
         cc_list.append(ESCALATION_CONTACTS["GeneralManager"])
@@ -4673,7 +4673,7 @@ def send_detailed_escalation_email(cs_email, violation_list, current_week):
         severity_color = "#c9302c" # Dark Red
         escalation_msg = "Level 2 (General Manager in CC)"
 
-    elif max_streak >= 6:
+    elif max_streak >= 12:
         # Week 6+: CC CEO (+ GM & Logistic Manager)
         
         
