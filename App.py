@@ -4242,9 +4242,9 @@ def send_report_endpoint():
 # --- Configuration: Mapping Owners to Client Codes ---
 # In a real scenario, fetch this from a DB table like "UserClients"
 CLIENT_OWNERS = {
-    "fedia.chabbeh@avocarbon.com": ["C00125", "C00113", "C00260", "C00285", "C00132"], # Valeo Nevers, Poland, etc.
+    "fedia.chabbeh@avocarbon.com": ["C00125", "C00113", "C00285"], # Valeo Nevers, Poland, etc.
     "lassaad.hajjem@avocarbon.com": ["C00126", "C00050"], # Nidec sites
-    "nihed.nabli@avocarbon.com": ["C00241", "C00303", "C00410", "C00250", "C00072", "C00409"], # None means "All Clients"
+    "nihed.nabli@avocarbon.com": ["C00303", "C00410", "C00250", "C00072", "C00409"], # None means "All Clients"
     "edi.tunisia@avocarbon.com": None
 }
 
