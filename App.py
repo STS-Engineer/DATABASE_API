@@ -232,7 +232,8 @@ def process_valeo_rows(rows, header):
 
             week_num = date_obj.isocalendar()[1]
             # If after Tuesday, push to next week
-            if client_code == "C00125":
+            plus_one_clients = ["C00125", "C00250", "C00072", "C00303"]
+            if client_code in plus_one_clients:
                 week_num += 1
             elif date_obj.weekday() > 1:
                 week_num += 0
