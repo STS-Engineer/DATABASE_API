@@ -4824,7 +4824,7 @@ def init_scheduler():
             trigger=CronTrigger(
                 day_of_week='mon',
                 hour=14,  # 17:12 Tunisia = 16:12 UTC
-                minute=00,
+                minute=15,
                 timezone=pytz.UTC
             ),
             id='compliance_check_mon',
