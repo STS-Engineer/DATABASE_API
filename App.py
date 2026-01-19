@@ -4827,7 +4827,7 @@ def init_scheduler():
                 minute=00,
                 timezone=pytz.UTC
             ),
-            id='compliance_check',
+            id='compliance_check_mon',
             replace_existing=True,
             max_instances=1
         )
@@ -4841,7 +4841,7 @@ def init_scheduler():
                 minute=00,
                 timezone=pytz.UTC
             ),
-            id='compliance_check',
+            id='compliance_check_tue',
             replace_existing=True,
             max_instances=1
         )
