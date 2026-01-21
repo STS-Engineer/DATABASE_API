@@ -983,7 +983,7 @@ def parse_week_number(date_str):
 
 
 
-def convert_mmddyyyy_to_next_week(date_str):
+def convert_mmddyyyy_to_week(date_str):
     """
     Convert MM/DD/YYYY to ISO week format YYYY-WXX, incremented by one week.
     """
@@ -1001,11 +1001,11 @@ def convert_mmddyyyy_to_next_week(date_str):
         iso_year, iso_week, _ = next_week_dt.isocalendar()
         
         week_str = f"{iso_year}-W{iso_week:02d}"
-        logging.warning(f"[convert_mmddyyyy_to_week] Parsed: {dt} -> Next Week: {week_str}")
+        logging.warning(f"[] Parsed: {dt} -> Next Week: {week_str}")
         return week_str
         
     except Exception as e:
-        logging.error(f"[convert_mmddyyyy_to_week] Error: {e}")
+        logging.error(f"[] Error: {e}")
         return ""
 
 
