@@ -5055,30 +5055,15 @@ def trigger_compliance_check():
 
 @app.route("/scheduler-health", methods=["GET"])
 def scheduler_health():
-    """
-    Health check endpoint for monitoring.
-    Returns detailed scheduler status.
-    """
     try:
+        is_master = app_scheduler is not None and app_scheduler.running
         status = {
-            "scheduler_exists": app_scheduler is not None,
-            "scheduler_running": app_scheduler.running if app_scheduler else False,
-            "lock_connection_open": scheduler_db_conn is not None and not scheduler_db_conn.closed,
-            "environment": {
-                "initialized": os.environ.get('SCHEDULER_INITIALIZED'),
-                "werkzeug_main": os.environ.get('WERKZEUG_RUN_MAIN')
-            }
+            "worker_role": "MASTER" if is_master else "STANDBY",
+            "scheduler_running": is_master,
+            "database_lock_connection": scheduler_db_conn is not None and not scheduler_db_conn.closed,
+            "active_jobs": [j.id for j in app_scheduler.get_jobs()] if is_master else []
         }
-        
-        if app_scheduler and app_scheduler.running:
-            status["jobs"] = [j.id for j in app_scheduler.get_jobs()]
-            status["next_runs"] = {
-                j.id: str(j.next_run_time) 
-                for j in app_scheduler.get_jobs()
-            }
-        
         return jsonify(status), 200
-        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
