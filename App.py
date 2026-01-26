@@ -4833,7 +4833,7 @@ def init_scheduler():
             func=check_edi_compliance_job,
             trigger=CronTrigger(
                 day_of_week='mon',
-                hour=15,  # 17:12 Tunisia = 16:12 UTC
+                hour=13,  # 17:12 Tunisia = 16:12 UTC
                 minute=00,
                 timezone=pytz.UTC
             ),
@@ -4897,7 +4897,7 @@ def should_start_scheduler():
     Returns True only once per application lifecycle.
     """
     # For Werkzeug reloader (local dev), only run in main process
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'false':
+    if os.environ.get('WERKZEUG_RUN_MAIN') not in (None, 'true'):
         app.logger.info("🔇 Skipping scheduler (Werkzeug reloader sub-process)")
         return False
     
@@ -4928,10 +4928,6 @@ def ensure_scheduler_started():
     
     app._scheduler_bootstrap_done = True
     
-    # Check if we should attempt to start
-    if not should_start_scheduler():
-        return
-    
     try:
         # Double-check it's not already running
         if app_scheduler and app_scheduler.running:
@@ -4948,6 +4944,7 @@ def ensure_scheduler_started():
             
     except Exception as e:
         app.logger.error("❌ Scheduler bootstrap failed: %s", e, exc_info=True)
+
 
 # ========================= MANUAL TRIGGER ENDPOINTS =========================
 
@@ -5055,38 +5052,32 @@ def trigger_compliance_check():
 
 @app.route("/scheduler-health", methods=["GET"])
 def scheduler_health():
+    """
+    Health check endpoint for monitoring.
+    Returns detailed scheduler status.
+    """
     try:
-        is_master = app_scheduler is not None and app_scheduler.running
         status = {
-            "worker_role": "MASTER" if is_master else "STANDBY",
-            "scheduler_running": is_master,
-            "database_lock_connection": scheduler_db_conn is not None and not scheduler_db_conn.closed,
-            "active_jobs": [j.id for j in app_scheduler.get_jobs()] if is_master else []
+            "scheduler_exists": app_scheduler is not None,
+            "scheduler_running": app_scheduler.running if app_scheduler else False,
+            "lock_connection_open": scheduler_db_conn is not None and not scheduler_db_conn.closed,
+            "environment": {
+                "initialized": os.environ.get('SCHEDULER_INITIALIZED'),
+                "werkzeug_main": os.environ.get('WERKZEUG_RUN_MAIN')
+            }
         }
+        
+        if app_scheduler and app_scheduler.running:
+            status["jobs"] = [j.id for j in app_scheduler.get_jobs()]
+            status["next_runs"] = {
+                j.id: str(j.next_run_time) 
+                for j in app_scheduler.get_jobs()
+            }
+        
         return jsonify(status), 200
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-# Initialize scheduler when module loads (for production environments like Azure/Gunicorn)
-
-try:
-    # Directly initialize without checking should_start_scheduler() to avoid flag conflicts
-    if not hasattr(app, '_module_level_init_done'):
-        with app.app_context():
-            app.logger.info("🚀 Module-level scheduler initialization...")
-            app._module_level_init_done = True
-            app._scheduler_init_attempted = True  # Set this to prevent before_request from re-initializing
-            app._scheduler_bootstrap_done = True   # Set this too
-            app_scheduler = init_scheduler()
-            
-            if app_scheduler:
-                app.logger.info("✅ Module-level scheduler initialized successfully")
-            else:
-                app.logger.info("ℹ️  Module-level scheduler not started (another worker is master)")
-except Exception as e:
-    app.logger.error("❌ Module-level scheduler init failed: %s", e, exc_info=True)
-    
-
 
 
 # ========================= MAIN BLOCK (LOCAL DEV) =========================
