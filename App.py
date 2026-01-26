@@ -5080,6 +5080,19 @@ def scheduler_health():
         return jsonify({"error": str(e)}), 500
 
 
+# Initialize scheduler when module loads
+try:
+    with app.app_context():
+        app.logger.info("🚀 Module-level scheduler initialization...")
+        if not hasattr(app, '_scheduler_init_attempted'):
+            app._scheduler_init_attempted = True
+            app_scheduler = init_scheduler()
+except Exception as e:
+    app.logger.error("❌ Module-level scheduler init failed: %s", e, exc_info=True)
+    
+
+
+
 # ========================= MAIN BLOCK (LOCAL DEV) =========================
 
 if __name__ == "__main__":
