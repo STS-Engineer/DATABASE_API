@@ -4897,7 +4897,7 @@ def should_start_scheduler():
     Returns True only once per application lifecycle.
     """
     # For Werkzeug reloader (local dev), only run in main process
-    if os.environ.get('WERKZEUG_RUN_MAIN') not in (None, 'true'):
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'false':
         app.logger.info("🔇 Skipping scheduler (Werkzeug reloader sub-process)")
         return False
     
@@ -4928,6 +4928,10 @@ def ensure_scheduler_started():
     
     app._scheduler_bootstrap_done = True
     
+    # Check if we should attempt to start
+    if not should_start_scheduler():
+        return
+    
     try:
         # Double-check it's not already running
         if app_scheduler and app_scheduler.running:
@@ -4944,7 +4948,6 @@ def ensure_scheduler_started():
             
     except Exception as e:
         app.logger.error("❌ Scheduler bootstrap failed: %s", e, exc_info=True)
-
 
 # ========================= MANUAL TRIGGER ENDPOINTS =========================
 
@@ -5079,14 +5082,22 @@ def scheduler_health():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# Initialize scheduler when module loads (for production environments like Azure/Gunicorn)
 
-# Initialize scheduler when module loads
 try:
-    with app.app_context():
-        app.logger.info("🚀 Module-level scheduler initialization...")
-        if not hasattr(app, '_scheduler_init_attempted'):
-            app._scheduler_init_attempted = True
+    # Directly initialize without checking should_start_scheduler() to avoid flag conflicts
+    if not hasattr(app, '_module_level_init_done'):
+        with app.app_context():
+            app.logger.info("🚀 Module-level scheduler initialization...")
+            app._module_level_init_done = True
+            app._scheduler_init_attempted = True  # Set this to prevent before_request from re-initializing
+            app._scheduler_bootstrap_done = True   # Set this too
             app_scheduler = init_scheduler()
+            
+            if app_scheduler:
+                app.logger.info("✅ Module-level scheduler initialized successfully")
+            else:
+                app.logger.info("ℹ️  Module-level scheduler not started (another worker is master)")
 except Exception as e:
     app.logger.error("❌ Module-level scheduler init failed: %s", e, exc_info=True)
     
