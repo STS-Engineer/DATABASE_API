@@ -4833,8 +4833,8 @@ def init_scheduler():
             func=check_edi_compliance_job,
             trigger=CronTrigger(
                 day_of_week='mon',
-                hour=14,  # 17:12 Tunisia = 16:12 UTC
-                minute=15,
+                hour=15,  # 17:12 Tunisia = 16:12 UTC
+                minute=00,
                 timezone=pytz.UTC
             ),
             id='compliance_check_mon',
