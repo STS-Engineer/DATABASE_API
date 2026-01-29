@@ -14,3 +14,6 @@ xlsxwriter
 python-dotenv
 SQLAlchemy
 apscheduler
+Werkzeug
+paddleocr
+paddlepaddle
