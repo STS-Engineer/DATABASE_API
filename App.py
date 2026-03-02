@@ -4255,7 +4255,8 @@ CLIENT_OWNERS = {
     "fedia.chabbeh@avocarbon.com": ["C00125", "C00113", "C00285"], # Valeo Nevers, Poland, etc.
     "lassaad.hajjem@avocarbon.com": ["C00126", "C00050"], # Nidec sites
     "nihed.nabli@avocarbon.com": ["C00303", "C00410", "C00250", "C00072", "C00409"], # None means "All Clients"
-    "edi.tunisia@avocarbon.com": None
+    "edi.tunisia@avocarbon.com": None,
+    "oussama.mastouri@avocarbon.com": None
 }
 
 def get_consecutive_weeks():
