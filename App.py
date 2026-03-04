@@ -44,7 +44,158 @@ app.config['MAIL_DEFAULT_SENDER'] = 'administration.STS@avocarbon.com'
 mail = Mail(app)
 # Updated for Server 002 and administrationSTS user
 DATABASE_URL = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/EDI_IA"
+#-----------------------------------------------------Pour mexique -------------------------
+def detect_csv_delimiter(csv_text):
+    """
+    Detect delimiter for Monterrey TI files.
+    Prefer ',' or ';' (fallback to ',').
+    """
+    sample = (csv_text or "")[:5000]
 
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+        return dialect.delimiter
+    except Exception:
+        # fallback: simple heuristic
+        if sample.count(",") >= sample.count(";"):
+            return ","
+        return ";"
+def find_header_row(rows, required_cols, start_at_index=6, max_scan=40):
+    """
+    TI Monterrey: header usually at line 7 => index 6 (0-based).
+    This scans from start_at_index to locate the real header row.
+    Returns (header, data_rows) where data_rows starts with header row.
+    """
+    if not rows:
+        return None, []
+
+    end = min(len(rows), start_at_index + max_scan)
+    for i in range(start_at_index, end):
+        cand = [str(c).strip() for c in rows[i]]
+        cand_set = set(cand)
+        if all(col in cand_set for col in required_cols):
+            header = cand
+            data_rows = rows[i:]
+            data_rows[0] = header
+            return header, data_rows
+
+    return None, []
+
+def extract_pn_from_item_description(item_desc: str) -> str:
+    """
+    Extract PN from the beginning of Item Description.
+    Example:
+    '1870680 - BRUSH ASM/INLINE' -> '1870680'
+    '000103335/AA - BRUSH ASM/CART (NOTCH) (DCSS)' -> '000103335/AA'
+    """
+    if not item_desc:
+        return ""
+    return item_desc.split(" - ", 1)[0].strip()
+def process_monterrey_ti_caro_rows(rows, header):
+    pn_mapping = {
+        "1870678": "05-0396AM",
+        "1870681": "05-0411BM",
+        "1870682": "05-0412BM",
+        "1870683": "05-0413BM",
+        "1870685": "05-0415BM",
+        "1870686": "05-0416BM",
+        "1870680": "05-0420AM",
+        "1870687": "05-0424AM",
+        "000103335/AA": "05-0452M",
+        "000116611/AA": "05-0604",
+        "116611": "05-0604",
+    }
+
+    idx = {str(col).strip(): i for i, col in enumerate(header)}
+
+    required_cols = [
+        "Item Description",
+        "Quantity Required",
+        "Requirement Date",
+        "Release Date",
+        "Last Receipt Date",
+        "Last Receipt Qty",
+        "Last Advice Note",
+        "CUM Received",
+    ]
+    missing = [c for c in required_cols if c not in idx]
+    if missing:
+        logging.error(f"[Monterrey TI CARO] Missing columns: {missing}")
+        return []
+
+    processed = []
+
+    for row in rows[1:]:
+        try:
+            if len(row) < len(header):
+                row = row + [""] * (len(header) - len(row))
+
+            item_desc = (row[idx["Item Description"]] or "").strip()
+            if not item_desc:
+                continue
+
+            # Quantities
+            quantity_required = parse_euro_number((row[idx["Quantity Required"]] or "").strip())
+            last_receipt_qty = parse_euro_number((row[idx["Last Receipt Qty"]] or "").strip())
+            cum_received = parse_euro_number((row[idx["CUM Received"]] or "").strip())
+         
+            # Dates
+
+
+            req_date_raw = (row[idx["Requirement Date"]] or "").strip()
+            if req_date_raw == "0001-01-01": 
+                logging.warning(f"[Monterrey TI] Skipping placeholder line: {item_desc}")
+                continue
+            release_date_raw = clean_date_placeholder(row[idx["Release Date"]])
+            last_receipt_date_raw = clean_date_placeholder(row[idx["Last Receipt Date"]])
+
+            date_from_week = to_forecast_week(req_date_raw) if req_date_raw else ""
+            forecast_week = to_forecast_week(release_date_raw) if release_date_raw else ""
+            last_delivery_week = to_forecast_week(last_receipt_date_raw) if last_receipt_date_raw else ""
+
+            # Last delivery info
+            last_advice_note = (row[idx["Last Advice Note"]] or "").strip()
+
+            # Material logic (Item Description contains PN Cliente?)
+            pn = extract_pn_from_item_description(item_desc)
+            if pn not in pn_mapping:
+                logging.warning(f"[Monterrey TI] PN not mapped: {pn}")
+            if pn in pn_mapping:
+               client_material = pn
+               avo_material = pn_mapping[pn]
+            else:
+                # fallback if PN not mapped
+                 client_material = pn
+                 avo_material = pn
+
+            processed.append({
+                "Site": "Monterrey",
+                "ClientCode": "9100",
+
+                "ClientMaterialNo": client_material,
+                "AVOMaterialNo": avo_material,
+
+                "Quantity": quantity_required,
+                "DateFrom": date_from_week,      # semaine ISO
+                "DateUntil": req_date_raw,       # date brute (comme demandé)
+
+                "ForecastDate": forecast_week,   # semaine ISO
+
+                "LastDeliveryDate": last_delivery_week,  # semaine ISO
+                "LastDeliveredQuantity": last_receipt_qty,
+                "LastDeliveryNo": last_advice_note or None,
+
+                "CumulatedQuantity": cum_received,
+
+                "EDIStatus": "Forecast",
+                "ProductName": item_desc
+            })
+
+        except Exception as e:
+            logging.error(f"[Monterrey TI CARO] Row processing error: {e}")
+
+    logging.warning(f"[Monterrey TI CARO] Processed {len(processed)} records.")
+    return processed 
 def get_pg_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -163,7 +314,11 @@ def to_a_week(date_str):
     return f"{year}-W{week:02d}"
 
 
-
+def clean_date_placeholder(v):
+    v = (v or "").strip()
+    if v in ["", "0001-01-01", "01/01/0001", "1/1/0001"]:
+        return ""
+    return v
 
 def to_forecast_week(raw):
     """Convertit une date (format libre) ou CW en semaine ISO 'YYYY-WXX'"""
@@ -187,7 +342,7 @@ def to_forecast_week(raw):
     logging.warning(f"[Valeo] Format de date inconnu: '{raw}'")
     return ""
 
-
+#-----------------------------------------------------------------------------------------------
 
 def process_valeo_rows(rows, header):
     plant_to_client = {
@@ -2822,7 +2977,7 @@ def process_file_endpoint_germany():
             elif "DENSO MANUFACTURING ITALIA" in text and "MATERIAL RELEASE" in text:
                 if "AVO CARBON GERMANY GMBH" in text:
                     company = "Denso"
-                    extracted_records = process_denso_de_pdf(file_bytes)
+                    # extracted_records = process_denso_de_pdf(file_bytes)
                 else:
                     return jsonify({"error": "Unrecognized Denso recipient in PDF."}), 400
             else:
@@ -3362,6 +3517,181 @@ def analyze_single_week(
 
     return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet, "analysis_mode": "single_week"}
 
+# ========================= ROUTE Mexique =================
+
+@app.route("/detect-client-info-monterrey", methods=["POST"])
+def detect_client_info_monterrey():
+    data = request.get_json()
+    required_keys = ['file_name', 'file_content_base64']
+    if not data or not all(k in data for k in required_keys):
+        missing_keys = [k for k in required_keys if k not in data]
+        return jsonify({"error": f"Missing keys in request body: {', '.join(missing_keys)}"}), 400
+
+    file_name = data['file_name']
+    b64 = data['file_content_base64']
+    file_ext = os.path.splitext(file_name)[1] or ".dat"
+
+    # Monterrey TI: CSV only
+    if file_name.lower().endswith(".pdf") or data.get("file_type") == "pdf":
+        return jsonify({
+            "file_processed": file_name,
+            "site": "Monterrey",
+            "file_type": "pdf",
+            "file_recognition": False,
+            "reason": "monterrey_ti_csv_only"
+        }), 200
+
+    try:
+        csv_text = decode_and_clean_csv(b64)
+    except Exception as e:
+        return jsonify({
+            "file_processed": file_name,
+            "site": "Monterrey",
+            "file_type": "csv",
+            "file_recognition": False,
+            "reason": f"csv_decode_failed: {e}"
+        }), 200
+
+    if "TI Fluid Systems Supplier Schedule" not in (csv_text or ""):
+        return jsonify({
+            "file_processed": file_name,
+            "site": "Monterrey",
+            "file_type": "csv",
+            "file_recognition": False,
+            "reason": "missing_ti_fluid_systems_supplier_schedule"
+        }), 200
+
+    return jsonify({
+        "file_processed": file_name,
+        "company_detected": "TI AUTOMOTIVE CARO (Monterrey)",
+        "client_code": "9100",
+        "site": "Monterrey",
+        "file_type": "csv",
+        "file_recognition": True,
+        "suggested_filename": f"ti_automotive_caro_monterrey{file_ext}".lower()
+    }), 200
+
+@app.route("/process-MonterreySite", methods=["POST"])
+def process_file_endpoint_monterrey():
+    data = request.get_json()
+    required_keys = ['file_name', 'file_content_base64']
+    if not data or not all(k in data for k in required_keys):
+        missing_keys = [k for k in required_keys if k not in data]
+        return jsonify({"error": f"Missing keys in request body: {', '.join(missing_keys)}"}), 400
+
+    file_name = data['file_name']
+    b64 = data['file_content_base64']
+
+    # Monterrey TI: CSV only
+    if file_name.lower().endswith(".pdf") or data.get("file_type") == "pdf":
+        return jsonify({"error": "Monterrey TI route supports CSV only."}), 400
+
+    # 1) Decode
+    try:
+        csv_text = decode_and_clean_csv(b64)
+    except Exception as e:
+        return jsonify({"error": f"Invalid Base64/CSV content. Detail: {e}"}), 400
+
+    # 2) Detect TI CARO
+    if "TI Fluid Systems Supplier Schedule" not in (csv_text or ""):
+        return jsonify({"error": "Unsupported Monterrey file (not TI Fluid Systems Supplier Schedule)."}), 400
+
+    # 3) Read rows
+    try:
+        delimiter = detect_csv_delimiter(csv_text)
+        logging.warning(f"[Monterrey TI CARO] Detected delimiter: {delimiter}")
+
+        rows = list(csv.reader(io.StringIO(csv_text), delimiter=delimiter))
+        if not rows:
+            return jsonify({"error": "Empty CSV."}), 400
+
+        # clean rows (trim cells + remove trailing empty cells)
+        rows_cleaned = []
+        for row in rows:
+            cleaned_row = [cell.strip() for cell in row]
+            while cleaned_row and cleaned_row[-1] == '':
+                cleaned_row.pop()
+            rows_cleaned.append(cleaned_row)
+        rows = rows_cleaned
+
+        required_cols = [
+            "Item Description",
+            "Quantity Required",
+            "Requirement Date",
+            "Release Date",
+            "Last Receipt Date",
+            "Last Receipt Qty",
+            "Last Advice Note",
+            "CUM Received",
+        ]
+
+        # Header is around line 7 (index 6)
+        header, data_rows = find_header_row(rows, required_cols, start_at_index=6)
+        if not header:
+            return jsonify({"error": "Could not locate header row (expected around line 7)."}), 400
+
+        # ---- Monterrey FIX: handle commas inside Item Description (unquoted CSV) ----
+        # If a row has more columns than header, merge extras back into Item Description.
+        item_idx = header.index("Item Description")
+        expected_len = len(header)
+
+        fixed_rows = [header]
+        for row in data_rows[1:]:
+            # pad if shorter
+            if len(row) < expected_len:
+                row = row + [""] * (expected_len - len(row))
+
+            # if longer => Item Description got split by commas
+            if len(row) > expected_len:
+                extra = len(row) - expected_len
+
+                merged_item = ",".join(row[item_idx:item_idx + extra + 1]).strip()
+
+                new_row = []
+                new_row.extend(row[:item_idx])
+                new_row.append(merged_item)
+                new_row.extend(row[item_idx + extra + 1:])
+
+                # safety trim/pad
+                if len(new_row) > expected_len:
+                    new_row = new_row[:expected_len]
+                if len(new_row) < expected_len:
+                    new_row = new_row + [""] * (expected_len - len(new_row))
+
+                row = new_row
+
+                logging.warning(f"[Monterrey TI] Fixed comma-split Item Description: {merged_item}")
+
+            fixed_rows.append(row)
+
+        data_rows = fixed_rows
+
+    except Exception as e:
+        return jsonify({"error": f"CSV parsing error: {e}"}), 400
+
+    # 4) Extract
+    extracted_records = process_monterrey_ti_caro_rows(data_rows, header)
+    if not extracted_records:
+        return jsonify({"error": "No records extracted for Monterrey TI CARO."}), 422
+
+    # 5) Save to DB (keep your existing DB logic)
+    try:
+        success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
+        return jsonify({
+            "message": "Monterrey TI CARO processing completed.",
+            "file_processed": file_name,
+            "company_detected": "TI AUTOMOTIVE CARO (Monterrey)",
+            "client_code": "9100",
+            "site": "Monterrey",
+            "records_processed": len(extracted_records),
+            "records_inserted": success_count,
+            "records_failed": len(error_details),
+            "errors": error_details
+        }), (200 if success_count > 0 else 400)
+
+    except Exception as e:
+        logging.exception("[Monterrey TI CARO] Database error")
+        return jsonify({"error": f"Database error: {e}"}), 400
 
 # ========================= ROUTE =========================
 
