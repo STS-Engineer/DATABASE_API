@@ -45,6 +45,180 @@ mail = Mail(app)
 # Updated for Server 002 and administrationSTS user
 DATABASE_URL = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/EDI_IA"
 #-----------------------------------------------------Pour mexique -------------------------
+def process_nidec_elpaso_monterrey_pdf(pdf_bytes, file_name):
+    """
+    Monterrey - Nidec Automotive El Paso
+    ClientCode: 10367
+    Site: Monterrey
+
+    Extracts from PDF text:
+      - ForecastDate  : from "Release date MM/DD/YYYY" -> ISO week "YYYY-Wxx"
+      - ClientMaterialNo: from "NIDEC PART NUMBER: XXXXX"
+      - AVOMaterialNo : mapping (inside this function)
+      - LastDeliveryDate / LastDeliveredQuantity / LastDeliveryNo : from "Last goods receipt ..."
+      - Schedule rows : from table "DATE  QUANTITY  CUMM QTY."
+          -> DateUntil = raw date (MM/DD/YYYY)
+          -> DateFrom  = ISO week of that date
+          -> Quantity  = QUANTITY
+          -> CumulatedQuantity = CUMM QTY.
+      - EDIStatus: "Forecast"
+      - ProductName: "PART - DESCRIPTION" if description found, else part only
+    """
+
+    import re
+    import io
+    import logging
+
+    # 1) Mapping inside the function (same style as your other clients)
+    pn_mapping = {
+        "O000003528": "50-0819M",
+    }
+
+    # 2) Extract PDF text using your existing helper
+    #    (You already have parse_pdf(BytesIO(...)) in your codebase)
+    text = parse_pdf(io.BytesIO(pdf_bytes)) or ""
+    if not text.strip():
+        return []
+
+    # normalize whitespace a bit (but keep line breaks for easier regex sometimes)
+    text_norm = re.sub(r"[ \t]+", " ", text)
+
+    # 3) ForecastDate from "Release date MM/DD/YYYY"
+    m_rel = re.search(r"Release\s*date\s*([0-9]{2}/[0-9]{2}/[0-9]{4})", text_norm, re.IGNORECASE)
+    release_date = m_rel.group(1) if m_rel else ""
+    forecast_week = to_forecast_week(release_date) if release_date else ""
+
+    # 4) Split into blocks per "NIDEC PART NUMBER:" (some PDFs can contain multiple parts)
+    starts = [m.start() for m in re.finditer(r"NIDEC\s+PART\s+NUMBER:\s*\S+", text_norm, flags=re.IGNORECASE)]
+    if not starts:
+        # Not Nidec format
+        return []
+
+    blocks = []
+    for i in range(len(starts) - 1):
+        blocks.append(text_norm[starts[i]:starts[i + 1]])
+    blocks.append(text_norm[starts[-1]:])
+
+    all_records = []
+
+    # helper: parse integers like "50,000" or "1,846,500"
+    def _to_int(v):
+         """
+         Nidec PDF numbers are like: 50,000 or 1,846,500 (comma = thousand separator).
+                  We must NOT treat comma as decimal.
+             """
+         s = (v or "").strip()
+         if not s:
+            return 0
+
+         # remove spaces
+         s = s.replace(" ", "")
+
+         # common Nidec format: 1,846,500
+         # => remove commas
+         s = s.replace(",", "")
+
+         # keep only digits (safety)
+         s = re.sub(r"[^\d]", "", s)
+ 
+         return int(s) if s else 0
+    
+
+    for block in blocks:
+        # 5) Part number + description
+        m_part = re.search(r"NIDEC\s+PART\s+NUMBER:\s*([A-Za-z0-9\-\/]+)", block, flags=re.IGNORECASE)
+        part_no = m_part.group(1).strip() if m_part else ""
+
+        m_desc = re.search(r"DESCRIPTION:\s*([^\n\r]+)", block, flags=re.IGNORECASE)
+        desc = m_desc.group(1).strip() if m_desc else ""
+
+        if not part_no:
+            continue
+
+        client_material = part_no
+        if part_no in pn_mapping:
+            avo_material = pn_mapping[part_no]
+        else:
+            avo_material = part_no
+            logging.warning(f"[Monterrey Nidec El Paso] PN not mapped: {part_no}")
+
+        product_name = f"{part_no} - {desc}".strip(" -") if desc else part_no
+
+        # 6) Last goods receipt (qty/date/delivery note)
+        # Example seen: "Last goods receipt 20,000 items on09/25/2025 under delivery note no. 67321"
+        m_last = re.search(
+            r"Last\s+goods\s+receipt\s+([\d,]+)\s+items\s+on\s*([0-9]{2}/[0-9]{2}/[0-9]{4})\s+under\s+delivery\s+note\s+no\.\s*([A-Za-z0-9\-]+)",
+            block,
+            flags=re.IGNORECASE
+        )
+        last_qty = _to_int(m_last.group(1)) if m_last else 0
+        last_date_raw = m_last.group(2) if m_last else ""
+        last_no = m_last.group(3) if m_last else None
+
+        last_week = to_forecast_week(last_date_raw) if last_date_raw else ""
+
+        # 7) Extract schedule table rows: "MM/DD/YYYY  qty  cumm"
+        # We restrict parsing to the schedule section when possible, to avoid false matches.
+        # Start after the header "DATE QUANTITY CUMM QTY."
+        sched_start = re.search(r"DATE\s+QUANTITY\s+CUMM\s+QTY\.", block, flags=re.IGNORECASE)
+        sched_text = block[sched_start.end():] if sched_start else block
+
+        # Stop at the next major section if present
+        stop_m = re.search(
+            r"(CUMMS\s+AUTHORIZATION|FORECAST\s+SCHEDULE|LAST\s+DELIVERIES|TRANSIT\s+INFORMATION|SCHEDULE\s+AGREEMENT|PAGE:)",
+            sched_text,
+            flags=re.IGNORECASE
+        )
+        if stop_m:
+            sched_text = sched_text[:stop_m.start()]
+
+        # find all date lines
+        # Example: "08/25/2025 50,000 1,846,500"
+        line_pat = re.compile(r"\b([0-9]{2}/[0-9]{2}/[0-9]{4})\s+([\d,]+)\s+([\d,]+)\b")
+        matches = list(line_pat.finditer(sched_text))
+
+        for mm in matches:
+            date_str, qty_str, cumm_str = mm.groups()
+
+            # ignore backlog-like lines (sometimes appear as "Backlog 100 ...")
+            if date_str.lower() == "backlog":
+                continue
+
+            qty = _to_int(qty_str)
+            cumm = _to_int(cumm_str)
+            date_week = to_forecast_week(date_str) if date_str else ""
+
+            all_records.append({
+                "Site": "Monterrey",
+                "ClientCode": "10367",
+
+                "ClientMaterialNo": client_material,
+                "AVOMaterialNo": avo_material,
+                "ProductName": product_name,
+
+                "Quantity": qty,
+                "DateFrom": date_week,
+                "DateUntil": date_str,
+
+                "ForecastDate": forecast_week,
+
+                "LastDeliveryDate": last_week,
+                "LastDeliveredQuantity": last_qty,
+                "LastDeliveryNo": last_no,
+
+                "CumulatedQuantity": cumm,
+                "EDIStatus": "Forecast",
+            })
+
+    # 8) Dedup inside the same PDF (safe)
+    dedup = {}
+    for r in all_records:
+        k = (r["ClientCode"], r["Site"], r["ClientMaterialNo"], r["DateUntil"], r["ForecastDate"])
+        dedup[k] = r
+
+    return list(dedup.values())
+
+
 def detect_csv_delimiter(csv_text):
     """
     Detect delimiter for Monterrey TI files.
@@ -3518,6 +3692,61 @@ def analyze_single_week(
     return {"summary_per_group": summary_per_group, "green_sheet": green_sheet, "red_sheet": red_sheet, "analysis_mode": "single_week"}
 
 # ========================= ROUTE Mexique =================
+
+@app.route("/process-MonterreyNidecElPaso", methods=["POST"])
+def process_file_endpoint_monterrey_nidec_elpaso():
+
+    data = request.get_json()
+    required_keys = ["file_name", "file_content_base64"]
+
+    if not data or not all(k in data for k in required_keys):
+        missing = [k for k in required_keys if k not in data]
+        return jsonify({"error": f"Missing keys in request body: {', '.join(missing)}"}), 400
+
+    file_name = data["file_name"]
+    b64 = data["file_content_base64"]
+
+    # PDF only
+    if not file_name.lower().endswith(".pdf"):
+        return jsonify({"error": "Nidec El Paso route supports PDF only."}), 400
+
+    # Decode
+    try:
+        pdf_bytes = base64.b64decode(b64)
+    except Exception as e:
+        return jsonify({"error": f"Invalid base64. Detail: {e}"}), 400
+
+    # Detect correct PDF
+    text_preview = parse_pdf(io.BytesIO(pdf_bytes))[:1000]
+
+    if "NIDEC PART NUMBER" not in text_preview:
+        return jsonify({"error": "Unsupported PDF (not Nidec Automotive format)."}), 400
+
+    # Extract records
+    extracted_records = process_nidec_elpaso_monterrey_pdf(pdf_bytes, file_name)
+
+    if not extracted_records:
+        return jsonify({"error": "No records extracted for Monterrey Nidec El Paso."}), 422
+
+    # Save to DB
+    try:
+        success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
+
+        return jsonify({
+            "message": "Monterrey Nidec El Paso processing completed.",
+            "file_processed": file_name,
+            "company_detected": "Nidec Automotive El Paso",
+            "client_code": "10367",
+            "site": "Monterrey",
+            "records_processed": len(extracted_records),
+            "records_inserted": success_count,
+            "records_failed": len(error_details),
+            "errors": error_details
+        }), (200 if success_count > 0 else 400)
+
+    except Exception as e:
+        logging.exception("[Monterrey Nidec El Paso] Database error")
+        return jsonify({"error": f"Database error: {e}"}), 400
 
 @app.route("/detect-client-info-monterrey", methods=["POST"])
 def detect_client_info_monterrey():
