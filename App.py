@@ -2093,6 +2093,41 @@ scheduler.add_job(
     id='weekly_deliverydetails_purge',
     replace_existing=True
 )
+
+# -------------- 
+def purge_deliverydetails_job():
+    conn = None
+    try:
+        with app.app_context():
+            app.logger.info("🧹 Weekly purge of DeliveryDetails started")
+
+            conn = get_pg_connection()
+            with conn.cursor() as cur:
+                cur.execute('TRUNCATE TABLE public."DeliveryDetails";')
+
+            conn.commit()
+            app.logger.info("✅ DeliveryDetails table cleared")
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        app.logger.error(f"❌ Purge failed: {e}")
+
+    finally:
+        if conn:
+            conn.close()
+
+scheduler.add_job(
+    func=purge_deliverydetails_job,
+    trigger=CronTrigger(
+        day_of_week='wed',
+        hour=10,
+        minute=55,
+        timezone='Africa/Tunis'
+    ),
+    id='weekly_deliverydetails_purge',
+    replace_existing=True
+)
 # ---------------------------------------------------------
 # >>> NEW HELPER FUNCTIONS FOR OCR & PARSING <<<
 # ---------------------------------------------------------
