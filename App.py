@@ -2056,8 +2056,43 @@ def insert_deliverydetails(df):
 
 OCR_SERVICE_URL = "https://ocr-files-cdh9dbaqf2cufdgs.francecentral-01.azurewebsites.net/process-base64"
 
+#----------------------------- les fonctions pour truncate delivery detaills--------------------------- 
+def purge_deliverydetails_job():
+    """
+    Supprime toutes les données de la table DeliveryDetails chaque dimanche
+    """
+    conn = None
+    try:
+        with app.app_context():
+            app.logger.info("🧹 Weekly purge of DeliveryDetails started")
 
+            conn = get_pg_connection()
+            with conn.cursor() as cur:
+                cur.execute('TRUNCATE TABLE public."DeliveryDetails" RESTART IDENTITY CASCADE;')
 
+            conn.commit()
+            app.logger.info("✅ DeliveryDetails table cleared successfully")
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        app.logger.error(f"❌ DeliveryDetails purge failed: {e}", exc_info=True)
+
+    finally:
+        if conn:
+            conn.close()
+
+scheduler.add_job(
+    func=purge_deliverydetails_job,
+    trigger=CronTrigger(
+        day_of_week='sun',
+        hour=0,
+        minute=0,
+        timezone='Africa/Tunis'
+    ),
+    id='weekly_deliverydetails_purge',
+    replace_existing=True
+)
 # ---------------------------------------------------------
 # >>> NEW HELPER FUNCTIONS FOR OCR & PARSING <<<
 # ---------------------------------------------------------
