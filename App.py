@@ -2191,8 +2191,178 @@ def perform_ocr_on_base64(file_base64, filename):
         return None
 
 
+#------------------------------------- fonction pour les fichir de delivery ----------------------- 
+
+def normalize_stock_col(col):
+    if col is None:
+        return ""
+
+    col = str(col).strip()
+
+    # essaie de réparer les caractères cassés type DÃ©pÃ´t
+    try:
+        col = col.encode("latin1").decode("utf-8")
+    except Exception:
+        pass
+
+    import unicodedata
+    col = unicodedata.normalize("NFKD", col).encode("ascii", "ignore").decode("ascii")
+    col = col.lower().strip()
+
+    # normalisation légère
+    col = col.replace("_", " ")
+    col = " ".join(col.split())
+
+    return col
+
+def clean_stock_str(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
+def clean_stock_qty(value):
+    if pd.isna(value):
+        return 0
+    try:
+        return int(float(str(value).replace(",", ".").strip()))
+    except Exception:
+        return 0
+
+
+def clean_stock_date(value):
+    if pd.isna(value):
+        return None
+    try:
+        return pd.to_datetime(value).date().isoformat()
+    except Exception:
+        return None
+
+
+def generate_simple_delivery_no(prefix, index_num):
+    today_str = datetime.now().strftime("%Y%m%d")
+    return f"{prefix}-{today_str}-{index_num:04d}"
+
+
+def detect_stock_format(df):
+    cols = {normalize_stock_col(c) for c in df.columns}
+
+    if {"code article", "q. physique", "d. entree", "depot"}.issubset(cols):
+        return "platform"
+
+    if {"code article", "q. physique", "depot", "emplacement"}.issubset(cols):
+        return "sceet"
+
+    if {"designation", "qte livree", "date"}.issubset(cols):
+        return "transit"
+
+    return None
+
+
+def parse_stock_platform(df, file_name):
+    records = []
+    col_map = {normalize_stock_col(c): c for c in df.columns}
+    idx = 1
+
+    for _, row in df.iterrows():
+        product_code = clean_stock_str(row.get(col_map.get("code article")))
+        quantity = clean_stock_qty(row.get(col_map.get("q. physique")))
+        delivery_date = clean_stock_date(row.get(col_map.get("d. entree")))
+        depot = clean_stock_str(row.get(col_map.get("depot")))
+        emplacement = clean_stock_str(row.get(col_map.get("emplacement")))
+
+        if not product_code or quantity == 0:
+            continue
+
+        records.append({
+            "Site": "Tunisia",
+            "AVOMaterialNo": product_code,
+            "DeliveryNo": generate_simple_delivery_no("PLT", idx),
+            "Quantity": quantity,
+            "Date": delivery_date if delivery_date else date.today().isoformat(),
+            "Status": "Dispatched"
+        })
+        idx += 1
+
+    return records
+
+
+def parse_stock_sceet(df, file_name):
+    records = []
+    col_map = {normalize_stock_col(c): c for c in df.columns}
+    generated_date = date.today().isoformat()
+    idx = 1
+
+    for _, row in df.iterrows():
+        product_code = clean_stock_str(row.get(col_map.get("code article")))
+        quantity = clean_stock_qty(row.get(col_map.get("q. physique")))
+
+        if not product_code or quantity == 0:
+            continue
+
+        records.append({
+            "Site": "Tunisia",
+            "AVOMaterialNo": product_code,
+            "DeliveryNo": generate_simple_delivery_no("SCT", idx),
+            "Quantity": quantity,
+            "Date": generated_date,
+            "Status": "Dispatched"
+        })
+        idx += 1
+
+    return records
+
+
+def parse_stock_transit(df, file_name):
+    records = []
+    col_map = {normalize_stock_col(c): c for c in df.columns}
+    transit_index = 1
+
+    for _, row in df.iterrows():
+        product_code = clean_stock_str(row.get(col_map.get("designation")))
+        quantity = clean_stock_qty(row.get(col_map.get("qte livree")))
+        delivery_date = clean_stock_date(row.get(col_map.get("date")))
+
+        if not product_code or quantity == 0:
+            continue
+
+        date_for_record = delivery_date if delivery_date else date.today().isoformat()
+        date_for_no = date_for_record.replace("-", "")
+
+        records.append({
+            "Site": "Tunisia",
+            "AVOMaterialNo": product_code,
+            "DeliveryNo": f"TRS-{date_for_no}-{transit_index:04d}",
+            "Quantity": quantity,
+            "Date": date_for_record,
+            "Status": "Dispatched"
+        })
+        transit_index += 1
+
+    return records
+
+
+def process_stock_excel(file_bytes, file_name):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    df.columns = [str(c).strip() for c in df.columns]
+
+    print("DEBUG raw columns:", list(df.columns))
+
+    stock_format = detect_stock_format(df)
+
+    if stock_format == "platform":
+        return parse_stock_platform(df, file_name), "Stock Platform"
+
+    if stock_format == "sceet":
+        return parse_stock_sceet(df, file_name), "Stock SCEET"
+
+    if stock_format == "transit":
+        return parse_stock_transit(df, file_name), "Stock Transit"
+
+    raise ValueError(f"Format stock non reconnu pour le fichier : {file_name}")
+
+
+#---------------------------------------------------------------------------------------
 
 @app.route("/process-TunisiaSite", methods=['POST'])
 def process_file_endpoint():
@@ -2205,7 +2375,12 @@ def process_file_endpoint():
     file_name = data['file_name']
     file_content_base64 = data['file_content_base64']
     file_type = data.get('file_type', None)
-    is_pdf = (file_type == "pdf") or file_name.lower().endswith('.pdf')
+
+    file_ext = os.path.splitext(file_name)[1].lower()
+
+    is_pdf = (file_type == "pdf") or file_ext == ".pdf"
+    is_csv = (file_type == "csv") or file_ext == ".csv"
+    is_excel = file_ext in [".xlsx", ".xls"]
 
     try:
         file_bytes = base64.b64decode(file_content_base64)
@@ -2219,27 +2394,24 @@ def process_file_endpoint():
 
     # ---------- PDF path ----------
     if is_pdf and _looks_like_pdf(file_bytes):
-        
+
         # Check if it is scanned
         scan_resp, scan_status = is_scanned_pdf(file_bytes, file_name)
 
-        # >>> MODIFIED LOGIC: If scanned, try OCR instead of erroring <<<
+        # If scanned, try OCR
         if scan_resp is not None:
             logging.info(f"File {file_name} detected as scanned. Attempting OCR...")
-            
-            # 1. Call OCR Service
+
             ocr_text = perform_ocr_on_base64(file_content_base64, file_name)
-            
+
             if ocr_text:
-                # 2. Parse the OCR text using your specific logic
                 try:
                     parsed_data = extract_delivery_data_from_text(ocr_text)
-                    
+
                     if parsed_data:
-                        # 3. Save to DeliveryDetails
                         df_ocr = pd.DataFrame(parsed_data)
                         insert_deliverydetails(df_ocr)
-                        
+
                         return jsonify({
                             "message": "Scanned PDF processed via OCR.",
                             "file_processed": file_name,
@@ -2251,23 +2423,20 @@ def process_file_endpoint():
                         }), 200
                     else:
                         return jsonify({"error": "OCR succeeded but no delivery data extracted matches criteria."}), 422
-                        
+
                 except Exception as e:
                     logging.error(f"Error parsing OCR text: {e}")
                     return jsonify({"error": f"Error parsing OCR result: {e}"}), 500
             else:
-                 # OCR Failed: Return the original 'is_scanned' error response
-                 logging.warning("OCR service returned no text or failed.")
-                 return scan_resp, scan_status
+                logging.warning("OCR service returned no text or failed.")
+                return scan_resp, scan_status
 
-        # Not scanned: try FACTURE first (Delivery invoice)
+        # Not scanned: FACTURE first, otherwise vendor-specific PDF
         try:
             if _contains_facture(file_bytes):
-                # Site is Tunisia for this endpoint; keep <= 20 chars for schema
                 extracted_records = process_delivery_invoice_pdf(file_bytes, default_site="Tunisia")
                 company = "Delivery Invoice (FACTURE)"
             else:
-                # Fallback to your vendor-specific detectors
                 pdf_format = detect_pdf_format(file_bytes)
                 if not pdf_format:
                     return jsonify({"error": "Unknown or unsupported PDF format."}), 400
@@ -2295,13 +2464,26 @@ def process_file_endpoint():
             logging.exception("PDF processing error")
             return jsonify({"error": f"PDF processing error: {e}"}), 400
 
+    # ---------- Excel Stock path ----------
+    elif is_excel:
+        try:
+            extracted_records, company = process_stock_excel(file_bytes, file_name)
+
+            if not extracted_records:
+                return jsonify({"error": "No stock rows found in Excel file."}), 422
+
+        except Exception as e:
+            logging.exception("Excel stock processing error")
+            return jsonify({"error": f"Excel stock processing error: {e}"}), 400
+
     # ---------- CSV path ----------
-    else:
+    elif is_csv:
         try:
             logging.warning(f"DEBUG: first 100 b64 chars: {file_content_base64[:100]}")
             csv_text = decode_and_clean_csv(file_content_base64)
             csv_io = io.StringIO(csv_text)
             rows = list(csv.reader(csv_io, delimiter=';'))
+
             header = [col.strip() for col in rows[0]]
             rows_cleaned = []
             for row in rows:
@@ -2309,8 +2491,10 @@ def process_file_endpoint():
                 while cleaned_row and cleaned_row[-1] == '':
                     cleaned_row.pop()
                 rows_cleaned.append(cleaned_row)
+
             rows = rows_cleaned
             rows[0] = header
+
         except Exception as e:
             logging.error(f"Failed to decode and clean Base64 string for file {file_name}: {e}")
             return jsonify({"error": f"Invalid Base64 content. Detail: {e}"}), 400
@@ -2318,6 +2502,7 @@ def process_file_endpoint():
         company, header = detect_company_and_prepare(rows)
         if not company:
             return jsonify({"error": "Unknown or unsupported CSV format."}), 400
+
         if company == "Valeo":
             extracted_records = process_valeo_rows(rows, header)
         elif company == "Inteva":
@@ -2327,39 +2512,50 @@ def process_file_endpoint():
         else:
             return jsonify({"error": "Unrecognized company type."}), 400
 
+    else:
+        return jsonify({"error": f"Unsupported file type for file: {file_name}"}), 400
+
     # ---------- Save to DB ----------
     try:
-        # anything that contains "FACTURE" goes to DeliveryDetails
-        if company and "FACTURE" in str(company):
+        company_str = str(company or "").upper()
+
+        # FACTURE + STOCK => DeliveryDetails
+        if ("FACTURE" in company_str) or ("STOCK" in company_str):
             df = pd.DataFrame(extracted_records)
             if df.empty:
-                return jsonify({"error": "No delivery lines parsed"}), 422
+                return jsonify({"error": "No delivery/stock lines parsed"}), 422
 
             # ensure required columns exist
-            for col in ["Site","AVOMaterialNo","DeliveryNo","Date","Status","Quantity"]:
+            for col in ["Site", "AVOMaterialNo", "DeliveryNo", "Date", "Status", "Quantity"]:
                 if col not in df.columns:
                     df[col] = ""
 
-            # normalize and respect varchar lengths
+            # normalize
             df["Site"] = df["Site"].map(lambda s: _safestr(s)[:20])
-            df["AVOMaterialNo"] = df.apply(lambda r: _normalize_avo_ref(r.get("AVOMaterialNo"), None), axis=1)
             df["AVOMaterialNo"] = df["AVOMaterialNo"].map(lambda s: _safestr(s)[:30])
             df["DeliveryNo"] = df["DeliveryNo"].map(lambda s: _safestr(s)[:30])
             df["Date"] = df["Date"].map(_safestr)
             df["Status"] = df["Status"].map(_norm_status)
             df["Quantity"] = df["Quantity"].apply(_clean_qty).astype(int)
 
-            # pre-aggregate duplicates
-            key_cols = ["Site","AVOMaterialNo","DeliveryNo","Date","Status"]
+            # apply AVO normalization only for FACTURE
+            if "FACTURE" in company_str:
+                df["AVOMaterialNo"] = df.apply(
+                    lambda r: _normalize_avo_ref(r.get("AVOMaterialNo"), None), axis=1
+                )
+                df["AVOMaterialNo"] = df["AVOMaterialNo"].map(lambda s: _safestr(s)[:30])
+
+            # aggregate duplicates
+            key_cols = ["Site", "AVOMaterialNo", "DeliveryNo", "Date", "Status"]
             source_lines = len(df)
             df = df.groupby(key_cols, as_index=False)["Quantity"].sum()
             df = df[df["Quantity"] != 0].reset_index(drop=True)
 
-            # insert into DeliveryDetails (psycopg2 version)
+            # insert into DeliveryDetails
             insert_deliverydetails(df)
 
             return jsonify({
-                "message": "Delivery invoice processed.",
+                "message": "Delivery/Stock processed.",
                 "file_processed": file_name,
                 "company_detected": company,
                 "records_processed": int(source_lines),
@@ -2368,11 +2564,12 @@ def process_file_endpoint():
                 "errors": []
             }), 200
 
-        # non-FACTURE flows (Vendor PDFs / CSVs) keep using the EDI saver
+        # Other vendor EDI flows => EDIGlobal
         success_count, error_details = save_to_postgres_with_conflict_reporting(extracted_records)
         logging.warning(
-        f"DEBUG: DB result for {file_name}: inserted={success_count}, errors={len(error_details)}"
-    )
+            f"DEBUG: DB result for {file_name}: inserted={success_count}, errors={len(error_details)}"
+        )
+
         return jsonify({
             "message": "Processing completed.",
             "file_processed": file_name,
@@ -2386,12 +2583,6 @@ def process_file_endpoint():
     except Exception as e:
         logging.exception("Database error")
         return jsonify({"error": f"Database error: {e}"}), 400
-
-
-
-
-
-
 
 
 
@@ -5167,7 +5358,7 @@ def check_edi_compliance_job():
         # We check these 4 specific weeks for presence
         today = datetime.now()
         weeks_to_check = []
-        for i in range(15):
+        for i in range(10):
             d = today - timedelta(weeks=i)
             iso_year, iso_week, _ = d.isocalendar()
             weeks_to_check.append(f"{iso_year}-W{iso_week:02d}")
